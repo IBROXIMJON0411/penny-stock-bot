@@ -1,1 +1,3 @@
 requests
+requests
+redis==5.0.1
