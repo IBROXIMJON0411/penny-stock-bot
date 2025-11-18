@@ -8,10 +8,10 @@ import redis
 from urllib.parse import urlparse, parse_qs
 
 # ---------- Konfiguratsiya (ENV nomlari Render'da shu nom bilan bo'lishi kerak) ----------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
-REDIS_URL = os.environ.get("REDIS_URL")
+TELEGRAM_TOKEN = os.environ.get("7762047492:AAFartWb8w-nmi8Cqbl4rdBYmjW1yk8xDRY")
+CHAT_ID = os.environ.get("7288340454")
+POLYGON_API_KEY = os.environ.get("9IMXlZEBOvSD7LQTTsNd_pRZ0T5sFCDm")
+REDIS_URL = os.environ.get("redis://red-d4bqb56r433s73d3l9gg:6379")
 
 # Soatlarda minimal interval (alertlarni takrorlamaslik uchun)
 ALERT_REPEAT_HOURS = int(os.environ.get("ALERT_REPEAT_HOURS", "6"))
