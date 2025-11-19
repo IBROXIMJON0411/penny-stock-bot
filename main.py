@@ -205,5 +205,4 @@ def main_loop():
                 time.sleep(5)
     logging.info("Worker shutting down gracefully.")
     send_telegram_message("🤖 Penny Stock Alert Bot to'xtadi. Graceful shutdown amalga oshirildi.")
-if name == "main":
-    main_loop()
+
