@@ -15,10 +15,10 @@ except ImportError:
     pass  # Render yoki boshqa muhitda dotenv kerak emas
 
 # ---------- Konfiguratsiya ----------
-TELEGRAM_TOKEN = os.environ.get("7762047492:AAFartWb8w-nmi8Cqbl4rdBYmjW1yk8xDRY")
+CHAT_ID = os.environ.get("7288340454")
 POLYGON_API_KEY = os.environ.get("9IMXlZEBOvSD7LQTTsNd_pRZ0T5sFCDm")
 REDIS_URL = os.environ.get("redis://red-d4bqb56r433s73d3l9gg:6379")
-CHAT_ID = os.environ.get("7288340454")
+TELEGRAM_TOKEN = os.environ.get("7762047492:AAFartWb8w-nmi8Cqbl4rdBYmjW1yk8xDRY")
 
 ALERT_REPEAT_HOURS = int(os.environ.get("ALERT_REPEAT_HOURS", "6"))
 MAX_CHECK = int(os.environ.get("MAX_CHECK", "500"))
