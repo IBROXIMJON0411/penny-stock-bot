@@ -29,10 +29,10 @@ PAUSE_BETWEEN_TICKERS = float(os.environ.get("PAUSE_BETWEEN_TICKERS", "0.15"))
 
 # ---------- Tekshirish ----------
 required = {
-    "TELEGRAM_TOKEN": "7762047492:AAFartWb8w-nmi8Cqbl4rdBYmjW1yk8xDRY"
     "CHAT_ID": "7288340454"
     "POLYGON_API_KEY": "9IMXlZEBOvSD7LQTTsNd_pRZ0T5sFCDm"
     "REDIS_URL": "redis://red-d4bqb56r433s73d3l9gg:6379"
+    "TELEGRAM_TOKEN": "7762047492:AAFartWb8w-nmi8Cqbl4rdBYmjW1yk8xDRY"
 }
 missing = [k for k, v in required.items() if not v]
 if missing:
