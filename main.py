@@ -298,5 +298,5 @@ def main_loop():
     send_telegram_message(html.escape("🤖 Penny Stock Alert Bot to'xtadi. Graceful shutdown amalga oshirildi."))
 
 
-if _name_=="_main_":
+if __name__ == "__main__":
     main_loop()
