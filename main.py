@@ -194,7 +194,7 @@ def scan_once(max_check: int = MAX_CHECK) -> List[Tuple[str, float]]:
     penny: List[Tuple[str, float]] = []
     checked = 0
     cursor = None
-    limit_per_page = 100
+    limit_per_page = 20
     while checked < max_check and not STOP:
         params = {
             "market": "stocks",
