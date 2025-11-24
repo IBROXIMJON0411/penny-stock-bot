@@ -1,3 +1,9 @@
 requests
 requests
 redis==5.0.1
+Flask>=2.0,<3.0
+requests>=2.28
+redis>=4.5
+python-dotenv>=1.0
+urllib3>=1.26
+gunicorn>=20.1
