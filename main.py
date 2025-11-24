@@ -350,7 +350,7 @@ def start_worker():
     worker_thread.start()
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     # start background worker then run web server (Render expects a bound port)
     start_worker()
     logging.info("Starting web server on port %s", PORT)
