@@ -320,7 +320,7 @@ def main_loop():
     send_telegram_message(html.escape("🤖 Penny Stock Alert Bot to'xtadi. Graceful shutdown amalga oshirildi."))
 
 # ---------- Flask web server (health + control) ----------
-app = Flask(_name_)
+app = Flask(__name__)
 worker_thread: Optional[threading.Thread] = None
 
 
