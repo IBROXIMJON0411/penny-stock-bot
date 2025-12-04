@@ -299,5 +299,5 @@ def main():
         for _ in range(0, total, step):
             time.sleep(step)
 
-if _name_ == "__main__":
-    main()
+if __name__=="__main__":
+      main()
