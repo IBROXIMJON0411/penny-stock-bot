@@ -18,10 +18,10 @@ except Exception:
     pass
 
 # --- Config from env ---
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))  # default 5 min
