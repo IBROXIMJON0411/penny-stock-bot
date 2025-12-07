@@ -311,22 +311,31 @@ def format_msg(item: Dict) -> str:
 # --- Main loop ---
 def main():
     log.info("FDA news try")
-send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
-  except Exception:
+
+    try:
+        send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
+    except Exception:
         log.exception("Startup telegram failed")
+
+    seen = load_seen()
 
     while not STOP:
         try:
             items = fetch_fda_news()
+
             for it in items:
                 uid = it.get("uid")
                 if not uid:
                     continue
                 if uid in seen:
                     continue
+
                 msg = format_msg(it)
                 sent = send_telegram(msg)
+
                 if sent:
+                    seen.add(uid)
+                    save_seen_atomic(seen)
                     seen.add(uid)
                     save_seen_atomic(seen)
                 else:
