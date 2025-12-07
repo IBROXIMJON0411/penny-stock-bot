@@ -312,7 +312,7 @@ def format_msg(item: Dict) -> str:
 def main():
     log.info("FDA news try")
 send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
-    except Exception:
+  except Exception:
         log.exception("Startup telegram failed")
 
     while not STOP:
