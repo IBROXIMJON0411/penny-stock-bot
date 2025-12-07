@@ -23,7 +23,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 
 # --- Config ---
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 SEEN_FILE = os.getenv("SEEN_FILE", "fda_seen.json")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
