@@ -354,5 +354,6 @@ def main():
                     break
                 time.sleep(1)
 
-    save_seen_atomic __name__ == "__main__":
+    # --- Main ---
+if _name_ == "_main_":
     main()
