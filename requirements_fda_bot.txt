@@ -1,0 +1,6 @@
+requests>=2.28
+feedparser>=6.0
+beautifulsoup4>=4.12
+Ixml>=4.9
+urllib3>=1.26
+python-dotenv>=1.0 
