@@ -1,26 +1,15 @@
-#!/usr/bin/env python3
-# fda_news_bot_fixed.py
-"""
-FDA news bot — yaxshilangan versiya
-
-Env required:
-  TELEGRAM_TOKEN
-  TELEGRAM_CHAT_ID
-Optional:
-  POLL_INTERVAL (sek, default 300)
-  SEEN_FILE (default fda_seen.json)
-"""
 import os
 import time
 import json
 import logging
 import signal
 import html
-from typing import Set, List, Dict, Optional
+from typing import Set, List, Dict
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from urllib.parse import urljoin
+import xml.etree.ElementTree as ET
 
 # --- Config ---
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
@@ -58,7 +47,7 @@ def _handle_sig(signum, frame):
 signal.signal(signal.SIGINT, _handle_sig)
 signal.signal(signal.SIGTERM, _handle_sig)
 
-# --- Seen persistence (atomic save) ---
+# --- Seen persistence ---
 def load_seen() -> Set[str]:
     try:
         if os.path.exists(SEEN_FILE):
@@ -66,11 +55,9 @@ def load_seen() -> Set[str]:
                 data = json.load(f)
                 if isinstance(data, list):
                     return set(data)
-                elif isinstance(data, dict):
-                    return set(data.keys())
         return set()
     except Exception:
-        log.exception("Failed to load seen file, starting with empty set.")
+        log.exception("Failed to load seen file, starting empty.")
         return set()
 
 def save_seen_atomic(seen: Set[str]):
@@ -82,7 +69,7 @@ def save_seen_atomic(seen: Set[str]):
     except Exception:
         log.exception("Failed to save seen file")
 
-# --- Telegram send (HTML safe) ---
+# --- Telegram send ---
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -96,110 +83,87 @@ def send_telegram(text: str):
         resp.raise_for_status()
         log.info("Sent Telegram message")
     except Exception:
-        log.exception("Failed to send Telegram message")
+        log.exception("Failed to send Telegram")
 
-# --- Fetch FDA press releases ---
-FDA_API = "https://www.fda.gov/api/updates/press-releases.json"
+# --- Fetch FDA press releases via RSS ---
+FDA_RSS = "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feed-press-releases"
 
 def fetch_fda_news() -> List[Dict]:
     try:
-        resp = session.get(FDA_API, timeout=20)
-        if resp.status_code == 429:
-            ra = resp.headers.get("Retry-After")
-            wait = int(ra) if ra and ra.isdigit() else 60
-            log.warning("Rate limited by FDA API (429). Waiting %s seconds.", wait)
-            time.sleep(wait)
-            return []
+        resp = session.get(FDA_RSS, timeout=20)
         resp.raise_for_status()
-        j = resp.json()
-        # API returns "results" key with list of items
-        results = j.get("results")
-        if not isinstance(results, list):
-            log.warning("Unexpected FDA response format: 'results' missing or not a list")
-            return []
-        return results
+
+        root = ET.fromstring(resp.text)
+
+        items = []
+        for item in root.findall("./channel/item"):
+            title = item.findtext("title", "")
+            link = item.findtext("link", "")
+            date = item.findtext("pubDate", "")
+
+            items.append({
+                "uuid": link,   # unique ID
+                "title": title,
+                "url": link,
+                "date": date
+            })
+
+        return items
     except Exception:
         log.exception("Error fetching FDA news")
         return []
 
-# --- Format message with separate FDA tag ---
-def make_full_url(path_or_url: str) -> str:
-    # if path_or_url appears to be full URL, return as-is; otherwise join with FDA_BASE
-    if not path_or_url:
-        return FDA_BASE
-    p = path_or_url.strip()
-    if p.startswith("http://") or p.startswith("https://"):
-        return p
-    # ensure leading slash
-    if not p.startswith("/"):
-        p = "/" + p
-    return urljoin(FDA_BASE, p)
-
+# --- Format message ---
 def format_msg(item: Dict) -> str:
     title = html.escape(item.get("title") or "No title")
-    # item may have 'path' (relative link) or 'url' — check both
-    path = item.get("path") or item.get("url") or ""
-    link = make_full_url(path)
-    link_escaped = html.escape(link)
-    date = html.escape(item.get("release_date") or item.get("date") or "")
-    # Construct message: separate FDA tag
-    msg = (
+    link = html.escape(item.get("url") or "")
+    date = html.escape(item.get("date") or "")
+
+    return (
         f"🔔 <b>FDA</b>\n"
-        f"🚨 <b>Yangi press release</b>\n"
         f"📰 <b>{title}</b>\n"
         f"📅 {date}\n"
-        f"🔗 <a href=\"{link_escaped}\">Batafsil</a>"
+        f"🔗 <a href=\"{link}\">Batafsil</a>"
     )
-    return msg
 
 # --- Main loop ---
 def main():
     log.info("FDA news bot started. Poll interval: %s sec", POLL_INTERVAL)
     seen = load_seen()
-    # send optional startup message
+
     try:
-        send_telegram(f"🚀 <b>FDA bot</b> ishga tushdi. {html.escape(time.ctime())}")
-    except Exception:
+        send_telegram("🚀 <b>FDA bot</b> ишга тушди.")
+    except:
         pass
 
-    # Main polling
     while not STOP:
         try:
             items = fetch_fda_news()
-            if not items:
-                log.debug("No items fetched this run.")
-            else:
-                # iterate in reverse chronological order (API may already be sorted)
-                for it in items:
-                    uid = it.get("uuid") or it.get("id") or it.get("link") or it.get("path")
-                    if not uid:
-                        # fallback: use title+date hash
-                        uid = (it.get("title", "") + "|" + str(it.get("release_date", "")))[:200]
-                    if uid in seen:
-                        continue
-                    # New item — format and send
-                    try:
-                        msg = format_msg(it)
-                        send_telegram(msg)
-                    except Exception:
-                        log.exception("Failed to format/send message for uid=%s", uid)
-                    seen.add(uid)
-                    # Save after each new message to avoid data loss
-                    save_seen_atomic(seen)
-            # Sleep with small-granularity to allow graceful stop
-            slept = 0
-            while slept < POLL_INTERVAL and not STOP:
-                time.sleep(1)
-                slept += 1
-        except Exception:
-            log.exception("Unexpected error in main loop")
-            # small backoff on unexpected error
-            for _ in range(10):
+
+            for it in items:
+                uid = it["uuid"]
+                if uid in seen:
+                    continue
+
+                try:
+                    msg = format_msg(it)
+                    send_telegram(msg)
+                except:
+                    log.exception("Failed to send item")
+
+                seen.add(uid)
+                save_seen_atomic(seen)
+
+            # Sleep
+            for _ in range(POLL_INTERVAL):
                 if STOP:
                     break
                 time.sleep(1)
 
-    # on exit, persist seen set
+        except Exception:
+            log.exception("Main loop error")
+            time.sleep(5)
+
     save_seen_atomic(seen)
     log.info("FDA bot stopped.")
 
