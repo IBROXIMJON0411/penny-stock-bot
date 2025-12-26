@@ -18,6 +18,8 @@ from urllib3.util.retry import Retry
 import feedparser
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- Config ---
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
