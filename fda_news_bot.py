@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
-"""
 fda_news_bot.py — robust fetch (feeds, robots/sitemap, fallback scrape) + Telegram alerts.
-Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3, lxml
+Adds: bootstrap-on-start, date parsing from feeds/sitemaps/pages, max-age filtering.
+Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3, lxml (optional)
 """
 import os
 import time
@@ -9,8 +8,9 @@ import json
 import logging
 import signal
 import html
-from typing import Set, List, Dict
+from typing import Set, List, Dict, Optional
 from urllib.parse import urljoin
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -22,12 +22,17 @@ import feedparser
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
 
-# --- Config ---
+# --- Config (from env) ---
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 SEEN_FILE = os.getenv("SEEN_FILE", "fda_seen.json")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-FDA_BASE = "https://www.fda.gov"
+FDA_BASE = os.getenv("FDA_BASE", "https://www.fda.gov")
+
+# New options
+INITIAL_RUN_SEND = os.getenv("INITIAL_RUN_SEND", "false").lower() in ("1", "true", "yes")
+MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "30")) # only send items younger than this if date known
+SITEMAP_TITLE_FETCH_LIMIT = int(os.getenv("SITEMAP_TITLE_FETCH_LIMIT", "30"))
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise SystemExit("ERROR: TELEGRAM_TOKEN ва TELEGRAM_CHAT_ID керак!")
@@ -40,8 +45,6 @@ FDA_RSS_CANDIDATES = [
     "https://www.fda.gov/about-fda/press-releases.xml",
     "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feed-press-releases",
 ]
-
-SITEMAP_TITLE_FETCH_LIMIT = 30
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -60,7 +63,7 @@ session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
 session.headers.update({"User-Agent": "fda-news-bot/1.0"})
 
-# Graceful shutdown
+# --- Graceful shutdown ---
 STOP = False
 def _handle_sig(signum, frame):
     global STOP
@@ -70,38 +73,8 @@ def _handle_sig(signum, frame):
 signal.signal(signal.SIGINT, _handle_sig)
 signal.signal(signal.SIGTERM, _handle_sig)
 
-# Seen persistence
-def ensure_seen_dir():
-    d = os.path.dirname(SEEN_FILE)
-    if d and not os.path.exists(d):
-        try:
-            os.makedirs(d, exist_ok=True)
-        except Exception:
-            log.exception("Failed to create seen directory %s", d)
-
-def load_seen() -> Set[str]:
-    try:
-        if os.path.exists(SEEN_FILE):
-            with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-        return set()
-    except Exception:
-        log.exception("Failed to load seen file, starting empty.")
-        return set()
-
-def save_seen_atomic(seen: Set[str]):
-    try:
-        ensure_seen_dir()
-        tmp = SEEN_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(list(seen), f)
-        os.replace(tmp, SEEN_FILE)
-    except Exception:
-        log.exception("Failed to save seen file")
-
-# Telegram send
+# --- Seen persistence (atomic save) ---
+# --- Telegram send ---
 def send_telegram(text: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -119,7 +92,65 @@ def send_telegram(text: str) -> bool:
         log.exception("Failed to send Telegram message")
         return False
 
-# robots -> sitemap discovery
+# --- Date parsing helpers ---
+def parse_struct_time_to_iso(st) -> Optional[str]:
+    try:
+        if not st:
+            return None
+        # feedparser returns time.struct_time
+        dt = datetime.fromtimestamp(time.mktime(st), tz=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return None
+
+def try_parse_iso(dt_str: str) -> Optional[str]:
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    # try several common formats
+    fmts = [
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in fmts:
+        try:
+            # for %z aware formats
+            dt = datetime.strptime(s, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            continue
+    # fallback: try feedparser parser via parsedate
+    try:
+        parsed = feedparser._parse_date(s)
+        if parsed:
+            return parse_struct_time_to_iso(parsed)
+    except Exception:
+        pass
+    return None
+
+def parse_date_string(s: str) -> Optional[str]:
+    if not s:
+        return None
+    iso = try_parse_iso(s)
+    return iso
+
+def date_within_max_age(iso_date: Optional[str]) -> bool:
+    if not iso_date:
+        return True # if unknown date, allow (but bootstrap prevents bulk)
+    try:
+        dt = datetime.fromisoformat(iso_date)
+        now = datetime.now(dt.tzinfo or timezone.utc)
+        return now - dt <= timedelta(days=MAX_AGE_DAYS)
+    except Exception:
+        return True
+
+# --- helpers: robots -> sitemap discovery ---
 def get_robots_sitemaps(base_url: str) -> List[str]:
     try:
         robots_url = urljoin(base_url, "/robots.txt")
@@ -141,14 +172,13 @@ def get_robots_sitemaps(base_url: str) -> List[str]:
         return []
 
 def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
-    """Return list of {loc, lastmod, title} OR if sitemap_index -> list of sitemap locs"""
+    """Parse sitemap XML and return list of {loc, lastmod, title(optional)}"""
     try:
         r = session.get(sitemap_url, timeout=20)
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items = []
 
-        # Detect <urlset> entries
         for url_el in root.findall('.//{*}url'):
             loc_el = url_el.find('.//{*}loc') or url_el.find('loc')
             loc = (loc_el.text or "").strip() if loc_el is not None else ""
@@ -160,7 +190,6 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
             title = news_title_el.text.strip() if news_title_el is not None and news_title_el.text else ""
             items.append({"loc": loc, "lastmod": lastmod, "title": title})
 
-        # If no url entries found, maybe it's a sitemap index
         if not items:
             for sm in root.findall('.//{*}sitemap'):
                 loc_el = sm.find('.//{*}loc') or sm.find('loc')
@@ -168,7 +197,6 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
                 if loc:
                     items.append({"loc": loc, "lastmod": "", "title": ""})
 
-        # fallback: any <loc>
         if not items:
             for loc_el in root.findall('.//{*}loc'):
                 loc_text = (loc_el.text or "").strip()
@@ -180,25 +208,58 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
         log.exception("Failed to parse sitemap %s", sitemap_url)
         return []
 
-def fetch_title_from_page(url: str) -> str:
+def fetch_title_and_date_from_page(url: str) -> (str, Optional[str]):
+    title = ""
+    date_iso = None
     try:
         r = session.get(url, timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+        # title
         h1 = soup.find("h1")
         if h1 and h1.get_text(strip=True):
-            return h1.get_text(strip=True)
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content"):
-            return og.get("content").strip()
-        tt = soup.find("title")
-        if tt and tt.get_text(strip=True):
-            return tt.get_text(strip=True)
-    except Exception:
-        log.debug("Failed to fetch title for %s", url, exc_info=True)
-    return ""
+            title = h1.get_text(strip=True)
+        if not title:
+            og = soup.find("meta", property="og:title")
+            if og and og.get("content"):
+                title = og.get("content").strip()
+        if not title:
+            tt = soup.find("title")
+            if tt and tt.get_text(strip=True):
+                title = tt.get_text(strip=True)
 
-# Robust fetch
+        # date candidates
+        # 1) meta article:published_time
+        m = soup.find("meta", {"property": "article:published_time"}) or soup.find("meta", {"name": "article:published_time"})
+        if m and m.get("content"):
+            date_iso = parse_date_string(m.get("content"))
+            return title, date_iso
+        # 2) meta name=pubdate / publish-date / prpubdate
+        for name in ("pubdate", "publishdate", "publish-date", "date", "dc.date", "dc.date.issued", "prpubdate"):
+            m = soup.find("meta", {"name": name})
+            if m and m.get("content"):
+                date_iso = parse_date_string(m.get("content"))
+                if date_iso:
+                    return title, date_iso
+        # 3) time[datetime]
+        t = soup.find("time")
+        if t:
+            dt = t.get("datetime") or t.get_text()
+            date_iso = parse_date_string(dt)
+            if date_iso:
+                return title, date_iso
+        # 4) look for common classes
+        candidates = soup.select(".date, .posted-date, .published, .updated")
+        for c in candidates:
+            txt = c.get_text(strip=True)
+            date_iso = parse_date_string(txt)
+            if date_iso:
+                return title, date_iso
+    except Exception:
+        log.debug("Failed to fetch title/date for %s", url, exc_info=True)
+    return title, date_iso
+
+# --- Robust fetch: feeds -> robots/sitemap -> fallback scrape ---
 def fetch_fda_news() -> List[Dict]:
     # 1) try known feeds
     for feed_url in FDA_RSS_CANDIDATES:
@@ -217,7 +278,16 @@ def fetch_fda_news() -> List[Dict]:
             for e in entries:
                 link = e.get("link") or e.get("id") or ""
                 title = (e.get("title") or "").strip()
-                published = e.get("published") or e.get("updated") or ""
+                # parse date
+                pub_iso = None
+                if e.get("published_parsed"):
+                    pub_iso = parse_struct_time_to_iso(e.get("published_parsed"))
+                elif e.get("updated_parsed"):
+                    pub_iso = parse_struct_time_to_iso(e.get("updated_parsed"))
+                else:
+                    # sometimes feed has published or updated string
+                    pub_iso = parse_date_string(e.get("published") or e.get("updated") or "")
+                published = pub_iso or ""
                 uid = e.get("id") or link or (title + "|" + published)
                 if not link:
                     continue
@@ -237,32 +307,27 @@ def fetch_fda_news() -> List[Dict]:
         collected = []
         inspected = 0
 
-        # Iterate top-level sitemaps; handle sitemap-index by parsing sub-sitemaps
         for sm in sitemaps:
             entries = parse_sitemap_urls(sm)
             if not entries:
                 continue
 
-            # If these look like sitemap files (sub-sitemap index), parse them
+            # if entries are sitemap links, parse them
             sitemap_locs = [e["loc"] for e in entries if e.get("loc", "").lower().endswith(".xml")]
             if sitemap_locs:
                 for sub in sitemap_locs:
                     sub_entries = parse_sitemap_urls(sub)
-                    if not sub_entries:
-                        continue
-                    entries.extend(sub_entries)
+                    if sub_entries:
+                        entries.extend(sub_entries)
 
-            # Now entries should contain url entries; filter for press/news-like urls
             for e in entries:
                 loc = e.get("loc") or ""
                 if not loc:
                     continue
                 inspected += 1
                 low = loc.lower()
-                # broadened pattern list
                 if any(k in low for k in ("press", "press-release", "press-announcement", "press-announcements", "press-releases", "news-events", "/news-","/news/","/press/")):
                     collected.append(e)
-            # if we found anything, stop (we prefer the first sitemap with news)
             if collected:
                 break
 
@@ -274,25 +339,31 @@ def fetch_fda_news() -> List[Dict]:
                 loc = e.get("loc")
                 title = e.get("title") or ""
                 lastmod = e.get("lastmod") or ""
-                if not title:
-                    title = fetch_title_from_page(loc)
+                # parse lastmod to iso
+                lastmod_iso = parse_date_string(lastmod) or ""
+                if not title or not lastmod_iso:
+                    # attempt to fetch page for missing title/date
+                    t, d = fetch_title_and_date_from_page(loc)
+                    if not title:
+                        title = t
+                    if not lastmod_iso and d:
+                        lastmod_iso = d
                 uid = loc
-                items.append({"uid": uid, "title": title, "link": loc, "date": lastmod})
+                items.append({"uid": uid, "title": title, "link": loc, "date": lastmod_iso})
             if items:
                 log.info("Discovered %d items from sitemap", len(items))
                 return items
     except Exception:
         log.exception("Sitemap processing failed")
 
-    # 3) fallback: try several likely pages (several variants)
+    # 3) fallback: scrape several likely pages
     try:
         fallback_paths = [
             "/news-events/press-announcements",
-            "/news-events/press-announcements/",
             "/news-events/press-releases",
-            "/news-events/press-releases/",
             "/news-events",
-            "/about-fda/press-releases"
+            "/about-fda/press-releases",
+            "/press-announcements"
         ]
         for path in fallback_paths:
             fallback = urljoin(FDA_BASE, path)
@@ -309,8 +380,10 @@ def fetch_fda_news() -> List[Dict]:
                 if not href or not title:
                     continue
                 full = href if href.startswith("http") else urljoin(FDA_BASE, href)
-                uid = full
-                results.append({"uid": uid, "title": title, "link": full, "date": ""})
+                # try to fetch date/title if missing
+                t, d = fetch_title_and_date_from_page(full)
+                final_title = title if title else t
+                results.append({"uid": full, "title": final_title, "link": full, "date": d or ""})
             if results:
                 log.info("Scraped %d items from fallback %s", len(results), fallback)
                 return results
@@ -320,6 +393,7 @@ def fetch_fda_news() -> List[Dict]:
     log.warning("No FDA news found by any method")
     return []
 
+# --- Format message ---
 def format_msg(item: Dict) -> str:
     title = html.escape(item.get("title") or "No title")
     link = html.escape(item.get("link") or "")
@@ -331,25 +405,57 @@ def format_msg(item: Dict) -> str:
         f"🔗 <a href=\"{link}\">Batafsil</a>"
     )
 
+# --- Main loop ---
 def main():
     log.info("FDA news try")
-
     try:
         send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
     except Exception:
         log.exception("Startup telegram failed")
 
+    first_run = not os.path.exists(SEEN_FILE)
     seen = load_seen()
+
+    # bootstrap: if first run and INITIAL_RUN_SEND is False, mark current items as seen without sending
+    if first_run and not INITIAL_RUN_SEND:
+        try:
+            items = fetch_fda_news()
+            if items:
+                for it in items:
+                    uid = it.get("uid")
+                    if uid:
+                        seen.add(uid)
+                save_seen_atomic(seen)
+                log.info("Bootstrap: marked %d existing items as seen (no messages sent). Set INITIAL_RUN_SEND=true to override.", len(items))
+        except Exception:
+            log.exception("Bootstrap failed")
 
     while not STOP:
         try:
             items = fetch_fda_news()
 
-            for it in items:
+            # sort items: prefer those with date (newest first)
+            def sort_key(it):
+                d = it.get("date") or ""
+                try:
+                    return (0, datetime.fromisoformat(d)) if d else (1, datetime.min)
+                except Exception:
+                    return (1, datetime.min)
+            items_sorted = sorted(items, key=sort_key, reverse=True)
+
+            for it in items_sorted:
                 uid = it.get("uid")
                 if not uid:
                     continue
                 if uid in seen:
+                    continue
+
+                # date filtering
+                date_iso = it.get("date") or None
+                if date_iso and not date_within_max_age(date_iso):
+                    log.info("Skipping uid=%s because older than %d days (date=%s)", uid, MAX_AGE_DAYS, date_iso)
+                    seen.add(uid) # mark as seen so we don't retry forever
+                    save_seen_atomic(seen)
                     continue
 
                 msg = format_msg(it)
