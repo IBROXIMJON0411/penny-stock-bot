@@ -1,7 +1,3 @@
-fda_news_bot.py — robust fetch (feeds, robots/sitemap, fallback scrape) + Telegram alerts.
-Adds: bootstrap-on-start, date parsing from feeds/sitemaps/pages, max-age filtering.
-Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3, lxml (optional)
-"""
 import os
 import time
 import json
