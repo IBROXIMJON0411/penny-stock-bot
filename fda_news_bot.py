@@ -1,5 +1,3 @@
-FDA JSON API News Bot — Telegramга янгилик юбориш
-
 Environment required:
   TELEGRAM_TOKEN
   TELEGRAM_CHAT_ID
