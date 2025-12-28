@@ -103,6 +103,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-Express yourself with emojis
-💖 👍 😂 🎉
-Respond quickly and add fun and personality to your emails
+
