@@ -1,14 +1,3 @@
-FDA news Telegram bot — robust fetch (feeds, robots/sitemap, fallback scrape) + Telegram alerts.
-Features:
- - Loads config from .env
- - Creates a requests.Session with retries
- - Tries feeds -> robots/sitemap -> fallback scrape
- - Parses dates and displays YYYY-MM-DD in Telegram message
- - On first run (by default) marks existing items as seen (no flood)
- - Only sends new items thereafter
-Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3
-"""
-from __future__ import annotations
 import os
 import time
 import json
