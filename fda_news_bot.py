@@ -72,8 +72,8 @@ def _handle_sig(signum, frame):
 signal.signal(signal.SIGINT, _handle_sig)
 signal.signal(signal.SIGTERM, _handle_sig)
 
-# --- Seen persistence ---
-try:
+# --- Seen persistence --- 
+    try:
        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
