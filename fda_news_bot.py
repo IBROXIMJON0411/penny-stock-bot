@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-fda_news_bot.py — robust fetch (feeds, robots/sitemap, fallback scrape) + Telegram alerts.
-Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3
-"""
 import os
 import time
 import json
