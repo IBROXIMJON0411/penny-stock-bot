@@ -46,8 +46,8 @@ FDA_RSS_CANDIDATES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fda_news_bot")
 
-# --- HTTP session with retries (global) ---
-def _make_session() -> requests.Session:
+# --- HTTP sessions ---
+def _make_session_with_retry() -> requests.Session:
     s = requests.Session()
     retry_strategy = Retry(
         total=3,
@@ -61,7 +61,16 @@ def _make_session() -> requests.Session:
     s.headers.update({"User-Agent": "fda-news-bot/1.0"})
     return s
 
-session: requests.Session = _make_session()
+def _make_session_no_retry() -> requests.Session:
+    s = requests.Session()
+    no_retry = Retry(total=0)
+    s.mount("https://", HTTPAdapter(max_retries=no_retry))
+    s.mount("http://", HTTPAdapter(max_retries=no_retry))
+    s.headers.update({"User-Agent": "fda-news-bot/1.0"})
+    return s
+
+session: requests.Session = _make_session_with_retry()
+session_no_retry: requests.Session = _make_session_no_retry()
 
 # --- Graceful shutdown ---
 STOP = False
@@ -127,6 +136,7 @@ def parse_struct_time_to_iso(st) -> Optional[str]:
     try:
         if not st:
             return None
+        # feedparser gives time.struct_time
         dt = datetime.fromtimestamp(time.mktime(st), tz=timezone.utc)
         return dt.isoformat()
     except Exception:
@@ -186,7 +196,7 @@ def display_date(iso_date: Optional[str]) -> str:
 def get_robots_sitemaps(base_url: str) -> List[str]:
     try:
         robots_url = urljoin(base_url, "/robots.txt")
-        r = session.get(robots_url, timeout=10)
+        r = session_no_retry.get(robots_url, timeout=6)
         if r.status_code != 200:
             log.debug("robots.txt not available (%s): %s", robots_url, r.status_code)
             return []
@@ -204,11 +214,19 @@ def get_robots_sitemaps(base_url: str) -> List[str]:
         return []
 
 def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
+    """
+    Parse a sitemap or sitemap-index and return list of dicts:
+    - if urlset: list of {"loc", "lastmod", "title"}
+    - if sitemapindex: list of {"loc": sitemap_url, "lastmod": ""}
+    Use session_no_retry to avoid long retry backoffs.
+    """
     try:
-        r = session.get(sitemap_url, timeout=20)
+        r = session_no_retry.get(sitemap_url, timeout=8)
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items: List[Dict] = []
+
+        # url entries
         for url_el in root.findall('.//{*}url'):
             loc_el = url_el.find('.//{*}loc') or url_el.find('loc')
             if loc_el is None:
@@ -219,8 +237,10 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
             lastmod_el = url_el.find('.//{*}lastmod') or url_el.find('lastmod')
             lastmod = (lastmod_el.text or "").strip() if lastmod_el is not None else ""
             news_title_el = url_el.find('.//{http://www.google.com/schemas/sitemap-news/}title')
-            title = news_title_el.text.strip() if news_title_el is not None and news_title_el.text else ""
+            title = news_title_el.text.strip() if (news_title_el is not None and news_title_el.text) else ""
             items.append({"loc": loc, "lastmod": lastmod, "title": title})
+
+        # sitemap index entries
         if not items:
             for sm in root.findall('.//{*}sitemap'):
                 loc_el = sm.find('.//{*}loc') or sm.find('loc')
@@ -229,51 +249,60 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
                 loc = (loc_el.text or "").strip()
                 if loc:
                     items.append({"loc": loc, "lastmod": "", "title": ""})
+
+        # fallback any loc
         if not items:
             for loc_el in root.findall('.//{*}loc'):
+                if loc_el is None:
+                    continue
                 loc_text = (loc_el.text or "").strip()
                 if loc_text:
                     items.append({"loc": loc_text, "lastmod": "", "title": ""})
+
         return items
     except Exception:
         log.exception("Failed to parse sitemap %s", sitemap_url)
         return []
 
-# --- Page title & date extraction ---
+# --- Page title & date extraction (use no-retry session) ---
 def fetch_title_and_date_from_page(url: str) -> Tuple[str, Optional[str]]:
     title = ""
     date_iso = None
     try:
-        r = session.get(url, timeout=12)
+        r = session_no_retry.get(url, timeout=8)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         h1 = soup.find("h1")
-        if h1 and h1.get_text(strip=True):
+        if h1 is not None and h1.get_text(strip=True):
             title = h1.get_text(strip=True)
         if not title:
             og = soup.find("meta", property="og:title")
-            if og and og.get("content"):
+            if og is not None and og.get("content"):
                 title = og.get("content").strip()
         if not title:
             tt = soup.find("title")
-            if tt and tt.get_text(strip=True):
+            if tt is not None and tt.get_text(strip=True):
                 title = tt.get_text(strip=True)
+
         m = soup.find("meta", {"property": "article:published_time"}) or soup.find("meta", {"name": "article:published_time"})
-        if m and m.get("content"):
+        if m is not None and m.get("content"):
             date_iso = parse_date_string(m.get("content"))
             return title, date_iso
+
         for name in ("pubdate", "publishdate", "publish-date", "date", "dc.date", "dc.date.issued", "prpubdate"):
             m = soup.find("meta", {"name": name})
-            if m and m.get("content"):
+            if m is not None and m.get("content"):
                 date_iso = parse_date_string(m.get("content"))
                 if date_iso:
                     return title, date_iso
+
         t = soup.find("time")
-        if t:
+        if t is not None:
             dt = t.get("datetime") or t.get_text()
             date_iso = parse_date_string(dt)
             if date_iso:
                 return title, date_iso
+
         candidates = soup.select(".date, .posted-date, .published, .updated")
         for c in candidates:
             txt = c.get_text(strip=True)
@@ -329,16 +358,20 @@ def fetch_fda_news() -> List[Dict]:
             sitemaps = [urljoin(FDA_BASE, "/sitemap.xml"), urljoin(FDA_BASE, "/sitemap_index.xml")]
         collected: List[Dict] = []
         inspected = 0
+
         for sm in sitemaps:
             entries = parse_sitemap_urls(sm)
             if not entries:
                 continue
+
+            # if sitemap index returned sub-sitemaps, parse them
             sitemap_locs = [e["loc"] for e in entries if e.get("loc", "").lower().endswith(".xml")]
             if sitemap_locs:
                 for sub in sitemap_locs:
                     sub_entries = parse_sitemap_urls(sub)
                     if sub_entries:
                         entries.extend(sub_entries)
+
             for e in entries:
                 loc = e.get("loc") or ""
                 if not loc:
@@ -349,7 +382,9 @@ def fetch_fda_news() -> List[Dict]:
                     collected.append(e)
             if collected:
                 break
+
         log.info("Sitemap inspection: inspected %d urls, collected %d candidate news urls", inspected, len(collected))
+
         if collected:
             items: List[Dict] = []
             for e in collected[:SITEMAP_TITLE_FETCH_LIMIT]:
@@ -358,11 +393,16 @@ def fetch_fda_news() -> List[Dict]:
                 lastmod = e.get("lastmod") or ""
                 lastmod_iso = parse_date_string(lastmod) or ""
                 if not title or not lastmod_iso:
-                    t, d = fetch_title_and_date_from_page(loc)
-                    if not title:
-                        title = t
-                    if not lastmod_iso and d:
-                        lastmod_iso = d
+                    # be polite: small pause and use no-retry session for page fetch
+                    try:
+                        t, d = fetch_title_and_date_from_page(loc)
+                        if not title:
+                            title = t
+                        if not lastmod_iso and d:
+                            lastmod_iso = d
+                    except Exception:
+                        log.debug("Failed to fetch title/date for sitemap item %s", loc, exc_info=True)
+                    time.sleep(0.25)
                 uid = loc
                 items.append({"uid": uid, "title": title, "link": loc, "date": lastmod_iso})
             if items:
@@ -371,7 +411,7 @@ def fetch_fda_news() -> List[Dict]:
     except Exception:
         log.exception("Sitemap processing failed")
 
-    # 3) fallback: scrape likely pages
+    # 3) fallback scrapes
     try:
         fallback_paths = [
             "/news-events/press-announcements",
@@ -383,7 +423,7 @@ def fetch_fda_news() -> List[Dict]:
         for path in fallback_paths:
             fallback = urljoin(FDA_BASE, path)
             log.info("Trying fallback scrape: %s", fallback)
-            r = session.get(fallback, timeout=15)
+            r = session_no_retry.get(fallback, timeout=8)
             if r.status_code >= 400:
                 log.debug("Fallback page returned status %s for %s", r.status_code, fallback)
                 continue
@@ -395,7 +435,10 @@ def fetch_fda_news() -> List[Dict]:
                 if not href or not title:
                     continue
                 full = href if href.startswith("http") else urljoin(FDA_BASE, href)
-                t, d = fetch_title_and_date_from_page(full)
+                try:
+                    t, d = fetch_title_and_date_from_page(full)
+                except Exception:
+                    t, d = "", None
                 final_title = title if title else t
                 results.append({"uid": full, "title": final_title, "link": full, "date": d or ""})
             if results:
@@ -423,6 +466,7 @@ def format_msg(item: Dict) -> str:
 def main():
     log.info("FDA news try")
 
+    # startup ping
     try:
         send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
     except Exception:
@@ -450,7 +494,7 @@ def main():
         try:
             items = fetch_fda_news()
 
-            # sort items: newest first (items with date first)
+            # prefer items with date (newest first)
             def sort_key(it: Dict):
                 d = it.get("date") or ""
                 try:
@@ -461,9 +505,7 @@ def main():
 
             for it in items_sorted:
                 uid = it.get("uid")
-                if not uid:
-                    continue
-                if uid in seen:
+                if not uid or uid in seen:
                     continue
 
                 date_iso = it.get("date") or None
