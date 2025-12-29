@@ -123,7 +123,7 @@ def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
         r.raise_for_status()
         root = ET.fromstring(r.content)
         items: List[Dict] = []
-    date_iso: Optional[str] = None
+    date_iso: Optional[str] = None #
 # --- Robust fetch: feeds -> robots/sitemap -> fallback scrape ---
 def fetch_fda_news() -> List[Dict]:
     # 1) try known feeds
