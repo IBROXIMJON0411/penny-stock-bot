@@ -1,3 +1,10 @@
+fda_news_bot.py — fetch (feeds, robots/sitemap, fallback scrape) + Telegram alerts.
+Behaviour:
+ - INITIAL_RUN_SEND=false (default) => first run: mark existing items as seen, do NOT send them.
+ - Parses dates from feed/sitemap/page and shows YYYY-MM-DD in message.
+ - Filters out items older than MAX_AGE_DAYS (if date known).
+Requires: python-dotenv, requests, feedparser, beautifulsoup4, urllib3
+"""
 import os
 import time
 import json
