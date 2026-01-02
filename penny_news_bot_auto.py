@@ -167,12 +167,12 @@ def normalize_url(u: str) -> str:
             for v in new_qs[k]:
                 q_items.append((k, v))
         qstr = urlencode(q_items)
-        newp = p._replace(query=qstr, fragment="")
+        newp = p._replace(query=qstr, fragment=")
         return urlunparse(newp)
     except Exception:
-        return u "        (article.get("description") or "") +
+        return u "        (article.get("description") or ") +
         " " +
-        (article.get("content") or "")
+        (article.get("content") or ")
     ).lower()
     for kw in KEYWORDS:
         if kw.lower() in text:
