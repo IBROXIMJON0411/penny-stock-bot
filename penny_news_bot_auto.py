@@ -24,7 +24,7 @@ REDIS_URL = os.getenv("REDIS_URL")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))  # default 5 min
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # default 2 min
 MAX_CHECK = int(os.getenv("MAX_CHECK", "200"))  # how many tickers to scan per run
 API_CALLS_PER_MINUTE = int(os.getenv("API_CALLS_PER_MINUTE", "20"))  # throttle
 ESTIMATED_CALLS_PER_TICKER = int(os.getenv("ESTIMATED_CALLS_PER_TICKER", "2"))
@@ -41,7 +41,7 @@ SEEN_FILE = os.getenv("SEEN_FILE", "seen_articles.json")
 # Cache and cooldown settings
 PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))  # seconds
 POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # 15 minutes
-MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "15"))  # 15 per cycle
+MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "35"))  # 15 per cycle
 
 # Keywords filter
 KEYWORDS = [
