@@ -1,10 +1,11 @@
+#!/usr/bin/env python3
 import os
 import time
 import json
 import logging
 import html
-from typing import Optional, List, Tuple
-from urllib.parse import urlparse, parse_qs
+from typing import Optional, List, Tuple, Dict
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -30,10 +31,25 @@ API_CALLS_PER_MINUTE = int(os.getenv("API_CALLS_PER_MINUTE", "20"))  # throttle
 ESTIMATED_CALLS_PER_TICKER = int(os.getenv("ESTIMATED_CALLS_PER_TICKER", "2"))
 PAGE_SIZE_NEWS = int(os.getenv("PAGE_SIZE_NEWS", "5"))
 
+# threshold for price (only consider tickers with price < PRICE_THRESHOLD)
+PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", "3.0"))
+
 # minimal pause between tickers (seconds) to respect API limits
 PAUSE_BETWEEN_TICKERS = max(0.2, (ESTIMATED_CALLS_PER_TICKER * 60.0) / max(1, API_CALLS_PER_MINUTE))
 
 SEEN_FILE = os.getenv("SEEN_FILE", "seen_articles.json")
+
+# Cache and cooldown settings
+PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))  # seconds
+POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # 15 minutes
+MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "3"))
+
+# Keywords filter
+KEYWORDS = [
+    "earnings", "fda", "approval", "trial",
+    "merger", "acquisition", "contract",
+    "partnership", "offering", "sec", "lawsuit"
+]
 
 # Required checks
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not NEWSAPI_KEY or not POLYGON_API_KEY:
@@ -95,7 +111,6 @@ def load_seen() -> set:
 def save_seen(seen: set):
     if use_redis:
         try:
-            # replace set atomically
             tmp_key = "penny_seen_urls_tmp"
             if seen:
                 rconn.delete(tmp_key)
@@ -130,12 +145,42 @@ def send_telegram(msg_text: str):
     except Exception:
         logger.exception("Failed to send Telegram message")
 
-# --- Price caching and Polygon cooldown handling ---
-PRICE_CACHE: dict = {}  # symbol -> (price: float, ts: float)
-PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))  # seconds
+# --- Helpers: URL normalization to reduce duplicate articles ---
+REMOVE_QUERY_PREFIXES = ("utm_",)
+REMOVE_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
-POLYGON_COOLDOWN: dict = {}  # symbol -> next_allowed_timestamp (float)
-POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # default 15 minutes
+def normalize_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        qs = parse_qs(p.query, keep_blank_values=True)
+        # filter query params
+        new_qs = {}
+        for k, vals in qs.items():
+            if any(k.lower().startswith(pref) for pref in REMOVE_QUERY_PREFIXES):
+                continue
+            if k.lower() in REMOVE_QUERY_KEYS:
+                continue
+            new_qs[k] = vals
+        # sort keys for deterministic order
+        q_items = []
+        for k in sorted(new_qs.keys()):
+            for v in new_qs[k]:
+                q_items.append((k, v))
+        qstr = urlencode(q_items)
+        newp = p._replace(query=qstr, fragment="")
+        return urlunparse(newp)
+    except Exception:
+        return u "        (article.get("description") or "") +
+        " " +
+        (article.get("content") or "")
+    ).lower()
+    for kw in KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
+
+# --- Price caching and Polygon cooldown handling ---
+PRICE_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (price, ts)
 
 def _cache_get(symbol: str) -> Optional[float]:
     rec = PRICE_CACHE.get(symbol.upper())
@@ -150,16 +195,13 @@ def _cache_get(symbol: str) -> Optional[float]:
 def _cache_set(symbol: str, price: float):
     PRICE_CACHE[symbol.upper()] = (price, time.time())
 
-# --- Polygon price using prev aggregate (close price) with cooldown on 403 ---
+POLYGON_COOLDOWN: Dict[str, float] = {}  # symbol -> next_allowed_timestamp
+
+# --- Polygon prev-close price with cooldown on 403 ---
 def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
-    """
-    Use Polygon v2/aggs/ticker/{ticker}/prev to get previous close price.
-    If Polygon returns 403, set cooldown for this ticker (don't call again until cooldown expires).
-    """
     ticker_u = ticker.upper()
-    # check cooldown
-    next_allowed = POLYGON_COOLDOWN.get(ticker_u)
     now = time.time()
+    next_allowed = POLYGON_COOLDOWN.get(ticker_u)
     if next_allowed and now < next_allowed:
         logger.debug("Polygon cooldown active for %s until %s", ticker_u, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_allowed)))
         return None
@@ -169,7 +211,6 @@ def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
     try:
         r = session.get(url, params=params, timeout=10)
         if r.status_code == 403:
-            # not authorized: set cooldown
             POLYGON_COOLDOWN[ticker_u] = now + POLYGON_COOLDOWN_SECONDS
             logger.warning("Polygon NOT_AUTHORIZED (403) for %s; setting cooldown %s seconds", ticker_u, POLYGON_COOLDOWN_SECONDS)
             return None
@@ -184,18 +225,15 @@ def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
         results = j.get("results")
         if not results or not isinstance(results, list):
             return None
-        # take the close price from first result
         first = results[0]
         close = first.get("c") or first.get("close") or None
         if close is None:
             return None
         price = float(close)
-        # cache and return
         _cache_set(ticker_u, price)
         return price
     except Exception:
         logger.exception("Error fetching prev close price for %s from Polygon", ticker_u)
-        # set a cooldown to avoid hammering if error persistent
         POLYGON_COOLDOWN[ticker_u] = now + POLYGON_COOLDOWN_SECONDS
         return None
 
@@ -205,7 +243,6 @@ def get_price_yfinance(ticker: str) -> Optional[float]:
         return None
     try:
         t = yf.Ticker(ticker)
-        # try fast attribute first
         info_price = None
         try:
             info = t.info
@@ -216,10 +253,8 @@ def get_price_yfinance(ticker: str) -> Optional[float]:
             price = float(info_price)
             _cache_set(ticker, price)
             return price
-        # fallback to history
         df = t.history(period="2d", interval="1d")
         if df is not None and not df.empty:
-            # take last close
             price = float(df["Close"].iloc[-1])
             _cache_set(ticker, price)
             return price
@@ -230,32 +265,35 @@ def get_price_yfinance(ticker: str) -> Optional[float]:
 # --- unified get_price with caching & polygon-first then fallback ---
 def get_price(ticker: str) -> Optional[float]:
     ticker_u = ticker.upper()
-    # cached?
     cached = _cache_get(ticker_u)
     if cached is not None:
         return cached
-
-    # try Polygon prev-close (respects cooldown)
     price = get_price_polygon_prev_close(ticker_u)
     if price is not None:
         return price
-
-    # fallback to yfinance if available
     price = get_price_yfinance(ticker_u)
     if price is not None:
         return price
-
-    # nothing
     logger.info("Price unavailable for %s (Polygon unavailable or unauthorized; yfinance fallback failed)", ticker_u)
     return None
 
-# --- now update scan_penny_tickers to use get_price (instead of direct polygon current price) ---
+# --- helper to extract cursor ---
+def extract_cursor(next_url: Optional[str]) -> Optional[str]:
+    if not next_url:
+        return None
+    try:
+        parsed = urlparse(next_url)
+        qs = parse_qs(parsed.query)
+        cur = qs.get("cursor")
+        if cur:
+            return cur[0]
+    except Exception:
+        logger.exception("Failed to parse cursor from next_url")
+    return None
+
+# --- scan tickers: uses get_price and PRICE_THRESHOLD ---
 def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float]]:
-    """
-    Returns list of (symbol, name, price) where price < 1.0
-    Uses Polygon tickers list endpoint but price is resolved using get_price() which respects cooldown/caching.
-    """
-    penny = []
+    penny: List[Tuple[str, str, float]] = []
     checked = 0
     cursor = None
     limit_per_page = 100
@@ -274,7 +312,6 @@ def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float
                 break
             if r.status_code == 403:
                 logger.error("Polygon returned 403 when listing tickers; cannot continue scanning (requires upgraded plan).")
-                # if listing tickers itself is not allowed, break out
                 break
             r.raise_for_status()
             j = r.json()
@@ -292,29 +329,19 @@ def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float
             if not symbol:
                 checked += 1
                 continue
-            # Respect price caching / cooldown and fallback
             price = get_price(symbol)
-            if price is not None and price < 1.0:
+            if price is not None and price < PRICE_THRESHOLD:
                 penny.append((symbol, name, price))
             checked += 1
             time.sleep(PAUSE_BETWEEN_TICKERS)
         next_url = j.get("next_url") or j.get("next_href") or None
-        cursor = None
-        if next_url:
-            try:
-                parsed = urlparse(next_url)
-                qs = parse_qs(parsed.query)
-                cur = qs.get("cursor")
-                if cur:
-                    cursor = cur[0]
-            except Exception:
-                pass
+        cursor = extract_cursor(next_url)
         if not cursor:
             break
-    logger.info("scan_penny_tickers found %d penny tickers", len(penny))
+    logger.info("scan_penny_tickers found %d penny tickers (threshold %.2f)", len(penny), PRICE_THRESHOLD)
     return penny
 
-# --- existing NewsAPI / formatting functions remain unchanged (reuse your earlier implementations) ---
+# --- NewsAPI functions ---
 def build_news_query(symbol: str, name: str) -> str:
     parts = [f'"{symbol}"']
     if name:
@@ -346,22 +373,10 @@ def fetch_news_for_ticker(symbol: str, name: str, page_size: int = PAGE_SIZE_NEW
         logger.exception("NewsAPI fetch failed for %s", symbol)
         return []
 
-def format_alert(article: dict, symbol: str, price: Optional[float]) -> str:
-    title = html.escape(article.get("title") or "No title")
-    src = html.escape((article.get("source") or {}).get("name") or "")
-    url = html.escape(article.get("url") or "")
-    published = article.get("publishedAt") or ""
-    msg = (
-        f"🚨 <b>{html.escape(symbol)}</b>  <code>${(price or 0):.4f}</code>\n"
-        f"📰 <b>{title}</b>\nSource: {src}\nPublished: {published}\n{url}"
-    )
-    return msg
-
-# --- Main loop (reuse your existing main with new scan_penny_tickers/get_price) ---
+# --- Aggregate articles across tickers then send deduplicated alerts ---
 def main():
     logger.info("penny_news_bot_auto starting")
     seen = load_seen()
-    # Optional startup message
     try:
         send_telegram(f"🚀 penny_news_bot_auto started; polling every {POLL_INTERVAL}s")
     except Exception:
@@ -373,30 +388,78 @@ def main():
             if not penny_list:
                 logger.info("No penny tickers found this run.")
             else:
-                for sym, name, price in penny_list:
-                    logger.info("Checking news for %s (price=%.4f) name=%s", sym, price, name)
-                    arts = fetch_news_for_ticker(sym, name)
-                    if not arts:
-                        logger.debug("No articles for %s", sym)
+                # collect articles across all tickers to dedupe and aggregate tickers per article
+                articles_map: Dict[str, Dict] = {}  # normalized_url -> {"article": article, "tickers": set(), "min_price": float}
+                for symbol, name, price in penny_list:
+                    logger.debug("Fetching news for %s (price=%.4f)", symbol, price)
+                    arts = fetch_news_for_ticker(symbol, name)
                     for a in arts:
                         url = a.get("url")
                         if not url:
                             continue
-                        if url in seen:
+                        norm = normalize_url(url)
+                        if norm in seen:
                             continue
-                        msg = format_alert(a, sym, price)
-                        send_telegram(msg)
-                        seen.add(url)
-                    save_seen(seen)
+                        # filter by keywords
+                        if not is_relevant_article(a):
+                            continue
+                        entry = articles_map.get(norm)
+                        if entry is None:
+                            entry = {"article": a, "tickers": set(), "min_price": price}
+                            articles_map[norm] = entry
+                        entry["tickers"].add(symbol)
+                        if price is not None:
+                            if entry["min_price"] is None or price < entry["min_price"]:
+                                entry["min_price"] = price
                     time.sleep(PAUSE_BETWEEN_TICKERS)
+
+                if not articles_map:
+                    logger.info("No relevant articles found for penny tickers this run.")
+                else:
+                    # Sort articles by publishedAt descending (newest first)
+                    def art_pub_key(item):
+                        a = item[1]["article"]
+                        p = a.get("publishedAt") or a.get("published") or ""
+                        try:
+                            return p
+                        except Exception:
+                            return ""
+                    sorted_items = sorted(articles_map.items(), key=art_pub_key, reverse=True)
+                    sent_count = 0
+                    for norm_url, info in sorted_items:
+                        if sent_count >= MAX_ARTICLES_PER_RUN:
+                            break
+                        article = info["article"]
+                        tickers = sorted(info["tickers"])
+                        min_price = info["min_price"]
+                        # format combined message
+                        tickers_str = ", ".join(html.escape(t) for t in tickers)
+                        title = html.escape(article.get("title") or "No title")
+                        src = html.escape((article.get("source") or {}).get("name") or "")
+                        published = article.get("publishedAt") or article.get("published") or ""
+                        link = html.escape(article.get("url") or norm_url)
+                        msg = (
+                            f"🚨 <b>{tickers_str}</b>  <code>${(min_price or 0):.4f}</code>\n"
+                            f"📰 <b>{title}</b>\nSource: {src}\nPublished: {published}\n{link}"
+                        )
+                        try:
+                            send_telegram(msg)
+                            sent_count += 1
+                            # mark as seen (use normalized URL)
+                            seen.add(norm_url)
+                        except Exception:
+                            logger.exception("Failed to send Telegram for article %s", norm_url)
+                    if sent_count:
+                        save_seen(seen)
+                        logger.info("Sent %d new article alerts this run", sent_count)
         except Exception:
             logger.exception("Unexpected error in main loop")
 
-        # after run sleep POLL_INTERVAL with interruption every few seconds
+        # sleep POLL_INTERVAL with small steps
         total = POLL_INTERVAL
         step = 5
         for _ in range(0, total, step):
             time.sleep(step)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
