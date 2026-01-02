@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import time
 import json
@@ -42,7 +41,7 @@ SEEN_FILE = os.getenv("SEEN_FILE", "seen_articles.json")
 # Cache and cooldown settings
 PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))  # seconds
 POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # 15 minutes
-MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "3"))
+MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "15"))  # 15 per cycle
 
 # Keywords filter
 KEYWORDS = [
@@ -61,9 +60,15 @@ logger = logging.getLogger("penny_news_bot_auto")
 
 # --- Requests session with retries ---
 session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504],
-                respect_retry_after_header=True, allowed_methods=frozenset(["GET", "POST"]))
+retries = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    respect_retry_after_header=True,
+    allowed_methods=frozenset(["GET", "POST", "HEAD"])
+)
 session.mount("https://", HTTPAdapter(max_retries=retries))
+session.mount("http://", HTTPAdapter(max_retries=retries))
 session.headers.update({"User-Agent": "penny-news-auto/1.0"})
 
 # optional: import yfinance once (for fallback)
@@ -114,7 +119,8 @@ def save_seen(seen: set):
             tmp_key = "penny_seen_urls_tmp"
             if seen:
                 rconn.delete(tmp_key)
-                rconn.sadd(tmp_key, *list(seen))
+                if seen:
+                    rconn.sadd(tmp_key, *list(seen))
                 rconn.rename(tmp_key, "penny_seen_urls")
             else:
                 rconn.delete("penny_seen_urls")
@@ -167,13 +173,18 @@ def normalize_url(u: str) -> str:
             for v in new_qs[k]:
                 q_items.append((k, v))
         qstr = urlencode(q_items)
-        newp = p._replace(query=qstr, fragment=")
+        newp = p._replace(query=qstr, fragment="")
         return urlunparse(newp)
     except Exception:
-        return u "        (article.get("description") or ") +
-        " " +
-        (article.get("content") or ")
-    ).lower()
+        return u
+
+# --- Keywords filter ---
+def is_relevant_article(article: dict) -> bool:
+    text = " ".join([
+        (article.get("title") or ""),
+        (article.get("description") or ""),
+        (article.get("content") or "")
+    ]).lower()
     for kw in KEYWORDS:
         if kw.lower() in text:
             return True
@@ -420,10 +431,7 @@ def main():
                     def art_pub_key(item):
                         a = item[1]["article"]
                         p = a.get("publishedAt") or a.get("published") or ""
-                        try:
-                            return p
-                        except Exception:
-                            return ""
+                        return p or ""
                     sorted_items = sorted(articles_map.items(), key=art_pub_key, reverse=True)
                     sent_count = 0
                     for norm_url, info in sorted_items:
