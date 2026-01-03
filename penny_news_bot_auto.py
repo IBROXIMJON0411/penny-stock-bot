@@ -5,6 +5,7 @@ import logging
 import html
 from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from datetime import datetime
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -24,26 +25,22 @@ REDIS_URL = os.getenv("REDIS_URL")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # default 2 min
-MAX_CHECK = int(os.getenv("MAX_CHECK", "200"))  # how many tickers to scan per run
-API_CALLS_PER_MINUTE = int(os.getenv("API_CALLS_PER_MINUTE", "20"))  # throttle
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # seconds
+MAX_CHECK = int(os.getenv("MAX_CHECK", "200"))
+API_CALLS_PER_MINUTE = int(os.getenv("API_CALLS_PER_MINUTE", "20"))
 ESTIMATED_CALLS_PER_TICKER = int(os.getenv("ESTIMATED_CALLS_PER_TICKER", "2"))
 PAGE_SIZE_NEWS = int(os.getenv("PAGE_SIZE_NEWS", "5"))
 
-# threshold for price (only consider tickers with price < PRICE_THRESHOLD)
 PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", "3.0"))
-
-# minimal pause between tickers (seconds) to respect API limits
 PAUSE_BETWEEN_TICKERS = max(0.2, (ESTIMATED_CALLS_PER_TICKER * 60.0) / max(1, API_CALLS_PER_MINUTE))
 
 SEEN_FILE = os.getenv("SEEN_FILE", "seen_articles.json")
+SEEN_TTL = int(os.getenv("SEEN_TTL", str(24 * 3600)))  # 24 hours
 
-# Cache and cooldown settings
-PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))  # seconds
-POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # 15 minutes
-MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "35"))  # 15 per cycle
+PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))
+POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))
+MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "35"))
 
-# Keywords filter
 KEYWORDS = [
     "earnings", "fda", "approval", "trial",
     "merger", "acquisition", "contract",
@@ -71,13 +68,13 @@ session.mount("https://", HTTPAdapter(max_retries=retries))
 session.mount("http://", HTTPAdapter(max_retries=retries))
 session.headers.update({"User-Agent": "penny-news-auto/1.0"})
 
-# optional: import yfinance once (for fallback)
+# optional yfinance fallback
 try:
     import yfinance as yf
     HAVE_YFINANCE = True
 except Exception:
     HAVE_YFINANCE = False
-    logger.info("yfinance not available. Install with: pip install yfinance to enable fallback price source.")
+    logger.info("yfinance not installed — install with: pip install yfinance to enable fallback")
 
 # --- Redis optional ---
 use_redis = False
@@ -94,48 +91,69 @@ if REDIS_URL:
         rconn = None
         use_redis = False
 
-# --- Seen storage (Redis set or local file) ---
-def load_seen() -> set:
+# --- Seen storage (url -> timestamp) with pruning ---
+def load_seen() -> Dict[str, float]:
+    now = time.time()
+    seen: Dict[str, float] = {}
     if use_redis:
         try:
-            return set(rconn.smembers("penny_seen_urls") or [])
+            items = rconn.hgetall("penny_seen_map") or {}
+            for k, v in items.items():
+                try:
+                    ts = float(v)
+                    if now - ts <= SEEN_TTL:
+                        seen[k] = ts
+                except Exception:
+                    continue
+            return seen
         except Exception:
-            logger.exception("Failed to read seen set from Redis")
-            return set()
+            logger.exception("Failed to read seen map from Redis")
+            return {}
     else:
         try:
             with open(SEEN_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return set(data)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        try:
+                            ts = float(v)
+                            if now - ts <= SEEN_TTL:
+                                seen[k] = ts
+                        except Exception:
+                            continue
+            return seen
         except FileNotFoundError:
-            return set()
+            return {}
         except Exception:
             logger.exception("Failed to load seen file")
-            return set()
+            return {}
 
-def save_seen(seen: set):
+def save_seen(seen: Dict[str, float]):
     if use_redis:
         try:
-            tmp_key = "penny_seen_urls_tmp"
+            tmp = "penny_seen_map_tmp"
             if seen:
-                rconn.delete(tmp_key)
-                if seen:
-                    rconn.sadd(tmp_key, *list(seen))
-                rconn.rename(tmp_key, "penny_seen_urls")
+                rconn.delete(tmp)
+                mapping = {k: str(v) for k, v in seen.items()}
+                rconn.hset(tmp, mapping=mapping)
+                rconn.rename(tmp, "penny_seen_map")
             else:
-                rconn.delete("penny_seen_urls")
+                rconn.delete("penny_seen_map")
         except Exception:
-            logger.exception("Failed to save seen set to Redis")
+            logger.exception("Failed to save seen map to Redis")
     else:
         tmp = SEEN_FILE + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(list(seen), f)
+                json.dump(seen, f)
             os.replace(tmp, SEEN_FILE)
         except Exception:
             logger.exception("Failed to save seen file")
 
-# --- Telegram send (HTML safe) ---
+def mark_seen(seen: Dict[str, float], norm_url: str):
+    seen[norm_url] = time.time()
+
+# --- Telegram send ---
 def send_telegram(msg_text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -145,13 +163,13 @@ def send_telegram(msg_text: str):
         "disable_web_page_preview": False,
     }
     try:
-        resp = session.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
+        r = session.post(url, json=payload, timeout=10)
+        r.raise_for_status()
         logger.info("Telegram message sent")
     except Exception:
         logger.exception("Failed to send Telegram message")
 
-# --- Helpers: URL normalization to reduce duplicate articles ---
+# --- URL normalization ---
 REMOVE_QUERY_PREFIXES = ("utm_",)
 REMOVE_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
@@ -159,7 +177,6 @@ def normalize_url(u: str) -> str:
     try:
         p = urlparse(u)
         qs = parse_qs(p.query, keep_blank_values=True)
-        # filter query params
         new_qs = {}
         for k, vals in qs.items():
             if any(k.lower().startswith(pref) for pref in REMOVE_QUERY_PREFIXES):
@@ -167,7 +184,6 @@ def normalize_url(u: str) -> str:
             if k.lower() in REMOVE_QUERY_KEYS:
                 continue
             new_qs[k] = vals
-        # sort keys for deterministic order
         q_items = []
         for k in sorted(new_qs.keys()):
             for v in new_qs[k]:
@@ -178,7 +194,7 @@ def normalize_url(u: str) -> str:
     except Exception:
         return u
 
-# --- Keywords filter ---
+# --- Keyword relevance ---
 def is_relevant_article(article: dict) -> bool:
     text = " ".join([
         (article.get("title") or ""),
@@ -190,8 +206,8 @@ def is_relevant_article(article: dict) -> bool:
             return True
     return False
 
-# --- Price caching and Polygon cooldown handling ---
-PRICE_CACHE: Dict[str, Tuple[float, float]] = {}  # symbol -> (price, ts)
+# --- Price cache & cooldown ---
+PRICE_CACHE: Dict[str, Tuple[float, float]] = {}
 
 def _cache_get(symbol: str) -> Optional[float]:
     rec = PRICE_CACHE.get(symbol.upper())
@@ -206,9 +222,8 @@ def _cache_get(symbol: str) -> Optional[float]:
 def _cache_set(symbol: str, price: float):
     PRICE_CACHE[symbol.upper()] = (price, time.time())
 
-POLYGON_COOLDOWN: Dict[str, float] = {}  # symbol -> next_allowed_timestamp
+POLYGON_COOLDOWN: Dict[str, float] = {}
 
-# --- Polygon prev-close price with cooldown on 403 ---
 def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
     ticker_u = ticker.upper()
     now = time.time()
@@ -216,14 +231,13 @@ def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
     if next_allowed and now < next_allowed:
         logger.debug("Polygon cooldown active for %s until %s", ticker_u, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_allowed)))
         return None
-
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker_u}/prev"
     params = {"apiKey": POLYGON_API_KEY}
     try:
         r = session.get(url, params=params, timeout=10)
         if r.status_code == 403:
             POLYGON_COOLDOWN[ticker_u] = now + POLYGON_COOLDOWN_SECONDS
-            logger.warning("Polygon NOT_AUTHORIZED (403) for %s; setting cooldown %s seconds", ticker_u, POLYGON_COOLDOWN_SECONDS)
+            logger.warning("Polygon 403 for %s; applying cooldown %s sec", ticker_u, POLYGON_COOLDOWN_SECONDS)
             return None
         if r.status_code == 429:
             ra = r.headers.get("Retry-After")
@@ -244,11 +258,10 @@ def get_price_polygon_prev_close(ticker: str) -> Optional[float]:
         _cache_set(ticker_u, price)
         return price
     except Exception:
-        logger.exception("Error fetching prev close price for %s from Polygon", ticker_u)
+        logger.exception("Polygon prev-close failed for %s", ticker_u)
         POLYGON_COOLDOWN[ticker_u] = now + POLYGON_COOLDOWN_SECONDS
         return None
 
-# --- yfinance fallback ---
 def get_price_yfinance(ticker: str) -> Optional[float]:
     if not HAVE_YFINANCE:
         return None
@@ -273,7 +286,6 @@ def get_price_yfinance(ticker: str) -> Optional[float]:
         logger.exception("yfinance failed for %s", ticker)
     return None
 
-# --- unified get_price with caching & polygon-first then fallback ---
 def get_price(ticker: str) -> Optional[float]:
     ticker_u = ticker.upper()
     cached = _cache_get(ticker_u)
@@ -285,10 +297,10 @@ def get_price(ticker: str) -> Optional[float]:
     price = get_price_yfinance(ticker_u)
     if price is not None:
         return price
-    logger.info("Price unavailable for %s (Polygon unavailable or unauthorized; yfinance fallback failed)", ticker_u)
+    logger.debug("Price unavailable for %s", ticker_u)
     return None
 
-# --- helper to extract cursor ---
+# --- cursor helper ---
 def extract_cursor(next_url: Optional[str]) -> Optional[str]:
     if not next_url:
         return None
@@ -299,10 +311,10 @@ def extract_cursor(next_url: Optional[str]) -> Optional[str]:
         if cur:
             return cur[0]
     except Exception:
-        logger.exception("Failed to parse cursor from next_url")
+        logger.exception("Failed to parse cursor")
     return None
 
-# --- scan tickers: uses get_price and PRICE_THRESHOLD ---
+# --- scan tickers ---
 def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float]]:
     penny: List[Tuple[str, str, float]] = []
     checked = 0
@@ -322,7 +334,7 @@ def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float
                 time.sleep(wait)
                 break
             if r.status_code == 403:
-                logger.error("Polygon returned 403 when listing tickers; cannot continue scanning (requires upgraded plan).")
+                logger.error("Polygon returned 403 when listing tickers; cannot continue scanning.")
                 break
             r.raise_for_status()
             j = r.json()
@@ -352,7 +364,7 @@ def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float
     logger.info("scan_penny_tickers found %d penny tickers (threshold %.2f)", len(penny), PRICE_THRESHOLD)
     return penny
 
-# --- NewsAPI functions ---
+# --- NewsAPI ---
 def build_news_query(symbol: str, name: str) -> str:
     parts = [f'"{symbol}"']
     if name:
@@ -384,10 +396,23 @@ def fetch_news_for_ticker(symbol: str, name: str, page_size: int = PAGE_SIZE_NEW
         logger.exception("NewsAPI fetch failed for %s", symbol)
         return []
 
-# --- Aggregate articles across tickers then send deduplicated alerts ---
+def format_published(published_iso: Optional[str]) -> str:
+    if not published_iso:
+        return ""
+    try:
+        s = published_iso
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        local = dt.astimezone()
+        return local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return published_iso
+
+# --- main loop ---
 def main():
     logger.info("penny_news_bot_auto starting")
-    seen = load_seen()
+    seen_map = load_seen()
     try:
         send_telegram(f"🚀 penny_news_bot_auto started; polling every {POLL_INTERVAL}s")
     except Exception:
@@ -399,8 +424,7 @@ def main():
             if not penny_list:
                 logger.info("No penny tickers found this run.")
             else:
-                # collect articles across all tickers to dedupe and aggregate tickers per article
-                articles_map: Dict[str, Dict] = {}  # normalized_url -> {"article": article, "tickers": set(), "min_price": float}
+                articles_map: Dict[str, Dict] = {}
                 for symbol, name, price in penny_list:
                     logger.debug("Fetching news for %s (price=%.4f)", symbol, price)
                     arts = fetch_news_for_ticker(symbol, name)
@@ -409,9 +433,9 @@ def main():
                         if not url:
                             continue
                         norm = normalize_url(url)
-                        if norm in seen:
+                        ts = seen_map.get(norm)
+                        if ts and (time.time() - ts) <= SEEN_TTL:
                             continue
-                        # filter by keywords
                         if not is_relevant_article(a):
                             continue
                         entry = articles_map.get(norm)
@@ -427,7 +451,6 @@ def main():
                 if not articles_map:
                     logger.info("No relevant articles found for penny tickers this run.")
                 else:
-                    # Sort articles by publishedAt descending (newest first)
                     def art_pub_key(item):
                         a = item[1]["article"]
                         p = a.get("publishedAt") or a.get("published") or ""
@@ -440,11 +463,11 @@ def main():
                         article = info["article"]
                         tickers = sorted(info["tickers"])
                         min_price = info["min_price"]
-                        # format combined message
                         tickers_str = ", ".join(html.escape(t) for t in tickers)
                         title = html.escape(article.get("title") or "No title")
                         src = html.escape((article.get("source") or {}).get("name") or "")
-                        published = article.get("publishedAt") or article.get("published") or ""
+                        published_raw = article.get("publishedAt") or article.get("published") or ""
+                        published = format_published(published_raw)
                         link = html.escape(article.get("url") or norm_url)
                         msg = (
                             f"🚨 <b>{tickers_str}</b>  <code>${(min_price or 0):.4f}</code>\n"
@@ -453,17 +476,15 @@ def main():
                         try:
                             send_telegram(msg)
                             sent_count += 1
-                            # mark as seen (use normalized URL)
-                            seen.add(norm_url)
+                            mark_seen(seen_map, norm_url)
                         except Exception:
                             logger.exception("Failed to send Telegram for article %s", norm_url)
                     if sent_count:
-                        save_seen(seen)
+                        save_seen(seen_map)
                         logger.info("Sent %d new article alerts this run", sent_count)
         except Exception:
             logger.exception("Unexpected error in main loop")
 
-        # sleep POLL_INTERVAL with small steps
         total = POLL_INTERVAL
         step = 5
         for _ in range(0, total, step):
