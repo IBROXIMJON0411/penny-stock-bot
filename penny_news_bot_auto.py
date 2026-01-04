@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import time
 import json
@@ -40,11 +41,17 @@ PAUSE_BETWEEN_TICKERS = max(0.2, (ESTIMATED_CALLS_PER_TICKER * 60.0) / max(1, AP
 PRICE_CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "60"))        # seconds
 POLYGON_COOLDOWN_SECONDS = int(os.getenv("POLYGON_COOLDOWN_SECONDS", str(15 * 60)))  # 15 min
 
-# Important keywords to surface (also used in query)
+# Expanded important keywords to surface (used in queries and filtering)
 KEYWORDS = [
-    "earnings", "fda", "approval", "trial",
-    "merger", "acquisition", "contract",
-    "partnership", "offering", "sec", "lawsuit"
+    "earnings", "revenue", "guidance",
+    "fda", "approval", "trial", "phase",
+    "sec", "investigation", "lawsuit",
+    "merger", "acquisition", "buyout",
+    "offering", "public offering", "registered direct",
+    "contract", "partnership", "agreement",
+    "halt", "trading halt",
+    "reverse split", "compliance",
+    "nasdaq", "nyse", "delisting"
 ]
 
 # required checks
@@ -137,17 +144,6 @@ def try_parse_date(s: Optional[str]) -> Optional[datetime]:
     except Exception:
         pass
     return None
-
-
-def within_seconds(dt: datetime, seconds: int) -> bool:
-    try:
-        now = datetime.now(timezone.utc) if dt.tzinfo else datetime.now()
-        # make dt timezone-aware consistent with now
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (now - dt).total_seconds() <= seconds
-    except Exception:
-        return False
 
 
 # --- Seen persistence (url -> timestamp) with pruning ---
@@ -396,9 +392,7 @@ def scan_penny_tickers(max_check: int = MAX_CHECK) -> List[Tuple[str, str, float
 
 # --- Polygon News fetch ---
 def polygon_news_query_for_symbol(symbol: str) -> str:
-    # Build a query that includes the symbol and our keywords to focus on important stories
     kws = " OR ".join(KEYWORDS)
-    # quote the symbol to avoid accidental matches
     return f'"{symbol}" AND ({kws})'
 
 
@@ -423,7 +417,6 @@ def fetch_news_polygon_for_symbol(symbol: str, page_size: int = PAGE_SIZE_NEWS) 
             return []
         r.raise_for_status()
         j = r.json()
-        # Polygon usually returns 'results' list
         results = j.get("results") or []
         return results if isinstance(results, list) else []
     except Exception:
@@ -431,21 +424,32 @@ def fetch_news_polygon_for_symbol(symbol: str, page_size: int = PAGE_SIZE_NEWS) 
         return []
 
 
+# --- New is_relevant_article implementation (uses title, summary, description) ---
+def is_relevant_article(article: dict) -> bool:
+    text = (
+        (article.get("title") or "") + " " +
+        (article.get("summary") or "") + " " +
+        (article.get("description") or "")
+    ).lower()
+
+    for kw in KEYWORDS:
+        if kw.lower() in text:
+            return True
+    return False
+
+
 # --- Format alert message ---
 def format_alert_for_article(article: dict, tickers: List[str], min_price: Optional[float]) -> str:
-    # Polygon fields may vary; attempt to find URL/title/source/published
     url = article.get("article_url") or article.get("url") or article.get("canonical_url") or article.get("permalink") or ""
     title = article.get("title") or article.get("headline") or ""
     summary = article.get("summary") or article.get("description") or ""
     source = ""
-    # polygon may have 'publisher' or 'source' fields
     publisher = article.get("publisher") or article.get("source") or {}
     if isinstance(publisher, dict):
         source = publisher.get("name") or ""
     elif isinstance(publisher, str):
         source = publisher
     published_raw = article.get("published_utc") or article.get("published_at") or article.get("published") or article.get("created_utc") or ""
-    # format published into local tz
     published_str = ""
     dt = try_parse_date(published_raw)
     if dt:
@@ -471,7 +475,7 @@ def format_alert_for_article(article: dict, tickers: List[str], min_price: Optio
     return msg
 
 
-# --- Main logic: aggregate, dedupe, send ---
+# --- main loop ---
 def main():
     logger.info("penny_news_bot_polygon starting")
     seen = load_seen()
@@ -486,32 +490,24 @@ def main():
             if not penny_list:
                 logger.info("No penny tickers found this run.")
             else:
-                # collect articles mapped by normalized URL to aggregate tickers
-                articles_map: Dict[str, Dict] = {}  # norm_url -> {article, tickers:set, min_price}
+                articles_map: Dict[str, Dict] = {}
                 for symbol, name, price in penny_list:
                     logger.debug("Fetch news for %s (price=%.4f)", symbol, price)
                     results = fetch_news_polygon_for_symbol(symbol, PAGE_SIZE_NEWS)
                     for art in results:
-                        # Determine article URL and normalize
                         url = art.get("article_url") or art.get("url") or art.get("canonical_url") or art.get("permalink")
                         if not url:
-                            # skip if no url
                             continue
                         norm = normalize_url(url)
-                        # skip if seen recently
                         ts = seen.get(norm)
                         if ts and (time.time() - ts) <= SEEN_TTL:
                             continue
-                        # parse published date and skip if older than SEEN_TTL (avoid old news)
                         pub = art.get("published_utc") or art.get("published_at") or art.get("published") or ""
                         dt = try_parse_date(pub)
                         if dt:
-                            # if published older than SEEN_TTL, skip
                             if (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() > SEEN_TTL:
                                 continue
-                        # optional keyword double-check (already queried by keywords)
                         if not is_relevant_article(art):
-                            # still allow if title contains symbol (some important news may omit keywords)
                             title = (art.get("title") or "").lower()
                             if symbol.lower() not in title:
                                 continue
@@ -528,7 +524,6 @@ def main():
                 if not articles_map:
                     logger.info("No relevant Polygon news found this run.")
                 else:
-                    # sort by published datetime (newest first) if available
                     def pub_key(item):
                         art = item[1]["article"]
                         pub = art.get("published_utc") or art.get("published_at") or art.get("published") or ""
@@ -556,7 +551,6 @@ def main():
         except Exception:
             logger.exception("Unexpected error in main loop")
 
-        # sleep with early exit granularity
         total = POLL_INTERVAL
         step = 5
         for _ in range(0, total, step):
