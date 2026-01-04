@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-penny_news_bot_polygon.py
-
-- Uses Polygon (v2/reference/news) as primary news source (requires POLYGON_API_KEY).
-- Scans tickers via Polygon reference/tickers (requires Polygon plan that allows listing).
-- Filters news by important keywords (FDA, SEC, earnings, offering, etc.).
-- Avoids re-sending the same article within SEEN_TTL (default 24 hours).
-- Rate-limits and caches prices; falls back to yfinance if Polygon price unavailable.
-- Sends alerts via Telegram.
-"""
-from __future__ import annotations
 import os
 import time
 import json
