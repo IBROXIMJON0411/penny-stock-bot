@@ -2,540 +2,246 @@ import os
 import time
 import json
 import logging
-import signal
 import html
-from typing import Set, List, Dict, Optional, Tuple
-from urllib.parse import urljoin
-from datetime import datetime, timezone, timedelta
-
-from dotenv import load_dotenv
-load_dotenv()
+from datetime import datetime, timezone
+from typing import List, Tuple, Dict, Optional
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import feedparser
-from bs4 import BeautifulSoup
-import xml.etree.ElementTree as ET
 
-# --- Config (env) ---
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
-SEEN_FILE = os.getenv("SEEN_FILE", "/var/lib/fda_news_bot/fda_seen.json")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Optional dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# --- Config ---
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-FDA_BASE = os.getenv("FDA_BASE", "https://www.fda.gov")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REDIS_URL = os.getenv("REDIS_URL")
 
-# Behaviour
-INITIAL_RUN_SEND = os.getenv("INITIAL_RUN_SEND", "false").lower() in ("1", "true", "yes")
-MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "30"))
-SITEMAP_TITLE_FETCH_LIMIT = int(os.getenv("SITEMAP_TITLE_FETCH_LIMIT", "30"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))       # seconds
+MAX_CHECK = int(os.getenv("MAX_CHECK", "200"))               # tickers per scan
+PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", "8.0")) # max price to watch
+VOLUME_MULT = float(os.getenv("VOLUME_MULT", "2.0"))        # volume spike threshold
+CANDLE_INTERVAL = "15"                                       # 15-min candle
+PAGE_SIZE_NEWS = int(os.getenv("PAGE_SIZE_NEWS", "10"))
+MAX_ARTICLES_PER_RUN = int(os.getenv("MAX_ARTICLES_PER_RUN", "15"))
+SEEN_TTL = int(os.getenv("SEEN_TTL", str(24*3600)))
+SEEN_FILE = os.getenv("SEEN_FILE", "seen_articles.json")
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise SystemExit("ERROR: TELEGRAM_TOKEN ва TELEGRAM_CHAT_ID керак!")
-
-# Candidate feed URLs (try in order)
-FDA_RSS_CANDIDATES = [
-    "https://www.fda.gov/news-events/press-announcements.atom",
-    "https://www.fda.gov/news-events/press-announcements.xml",
-    "https://www.fda.gov/about-fda/press-releases.atom",
-    "https://www.fda.gov/about-fda/press-releases.xml",
-    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feed-press-releases",
+KEYWORDS = [
+    "earnings","fda","approval","trial","phase",
+    "sec","investigation","lawsuit",
+    "merger","acquisition","buyout",
+    "offering","contract","partnership","agreement",
+    "halt","trading halt","reverse split","compliance",
+    "nasdaq","nyse","delisting"
 ]
+
+# Required checks
+if not POLYGON_API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise SystemExit("ERROR: POLYGON_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID must be set")
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("fda_news_bot")
+logger = logging.getLogger("penny_news_volume_bot")
 
-# --- HTTP sessions ---
-def _make_session_with_retry() -> requests.Session:
-    s = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        respect_retry_after_header=True,
-        allowed_methods=frozenset(["GET", "POST", "HEAD"])
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry_strategy))
-    s.mount("http://", HTTPAdapter(max_retries=retry_strategy))
-    s.headers.update({"User-Agent": "fda-news-bot/1.0"})
-    return s
+# --- HTTP session ---
+session = requests.Session()
+retry_strategy = Retry(
+    total=3, backoff_factor=1, status_forcelist=[429,500,502,503,504],
+    respect_retry_after_header=True, allowed_methods=frozenset(["GET","POST"])
+)
+session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
+session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+session.headers.update({"User-Agent":"penny-news-volume-bot/1.0"})
 
-def _make_session_no_retry() -> requests.Session:
-    s = requests.Session()
-    no_retry = Retry(total=0)
-    s.mount("https://", HTTPAdapter(max_retries=no_retry))
-    s.mount("http://", HTTPAdapter(max_retries=no_retry))
-    s.headers.update({"User-Agent": "fda-news-bot/1.0"})
-    return s
+# optional Redis
+use_redis = False
+rconn = None
+if REDIS_URL:
+    try:
+        import redis as _redis
+        rconn = _redis.from_url(REDIS_URL, decode_responses=True)
+        rconn.ping()
+        use_redis = True
+        logger.info("Connected to Redis for seen cache")
+    except Exception:
+        logger.exception("Redis connection failed, falling back to file")
+        use_redis = False
 
-session: requests.Session = _make_session_with_retry()
-session_no_retry: requests.Session = _make_session_no_retry()
+# --- Utilities ---
+REMOVE_QUERY_PREFIXES = ("utm_",)
+REMOVE_QUERY_KEYS = {"fbclid","gclid","mc_cid","mc_eid"}
 
-# --- Graceful shutdown ---
-STOP = False
-def _handle_sig(signum, frame):
-    global STOP
-    log.info("Shutdown signal received (%s). Stopping gracefully...", signum)
-    STOP = True
+def normalize_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        qs = parse_qs(p.query, keep_blank_values=True)
+        new_qs = {}
+        for k,v in qs.items():
+            if any(k.lower().startswith(pref) for pref in REMOVE_QUERY_PREFIXES):
+                continue
+            if k.lower() in REMOVE_QUERY_KEYS:
+                continue
+            new_qs[k]=v
+        q_items = [(k,vv) for k in sorted(new_qs.keys()) for vv in new_qs[k]]
+        newp = p._replace(query=urlencode(q_items), fragment="")
+        return urlunparse(newp)
+    except Exception:
+        return u
 
-signal.signal(signal.SIGINT, _handle_sig)
-signal.signal(signal.SIGTERM, _handle_sig)
+def try_parse_date(s: Optional[str]):
+    if not s: return None
+    try:
+        if s.endswith("Z"): s = s.replace("Z","+00:00")
+        return datetime.fromisoformat(s)
+    except: pass
+    import email.utils
+    try: return email.utils.parsedate_to_datetime(s)
+    except: return None
 
-# --- Seen persistence (atomic save) ---
-def ensure_seen_dir():
-    d = os.path.dirname(SEEN_FILE)
-    if d and not os.path.exists(d):
+# --- Seen cache ---
+def load_seen() -> Dict[str,float]:
+    now=time.time()
+    seen:Dict[str,float]={}
+    if use_redis and rconn:
         try:
-            os.makedirs(d, exist_ok=True)
-        except Exception:
-            log.exception("Failed to create seen directory %s", d)
-
-def load_seen() -> Set[str]:
-    try:
-        if os.path.exists(SEEN_FILE):
-            with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-        return set()
-    except Exception:
-        log.exception("Failed to load seen file, starting empty.")
-        return set()
-
-def save_seen_atomic(seen: Set[str]):
-    try:
-        ensure_seen_dir()
-        tmp = SEEN_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sorted(list(seen)), f)
-        os.replace(tmp, SEEN_FILE)
-    except Exception:
-        log.exception("Failed to save seen file")
-
-# --- Telegram send ---
-def send_telegram(text: str) -> bool:
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }
-        r = session.post(url, json=payload, timeout=15)
-        r.raise_for_status()
-        log.info("Sent Telegram message")
-        return True
-    except Exception:
-        log.exception("Failed to send Telegram message")
-        return False
-
-# --- Date helpers ---
-def parse_struct_time_to_iso(st) -> Optional[str]:
-    try:
-        if not st:
-            return None
-        # feedparser gives time.struct_time
-        dt = datetime.fromtimestamp(time.mktime(st), tz=timezone.utc)
-        return dt.isoformat()
-    except Exception:
-        return None
-
-def try_parse_iso(dt_str: Optional[str]) -> Optional[str]:
-    if not dt_str:
-        return None
-    s = dt_str.strip()
-    fmts = [
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    for fmt in fmts:
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc).isoformat()
-        except Exception:
-            continue
-    try:
-        parsed = feedparser._parse_date(s)
-        if parsed:
-            return parse_struct_time_to_iso(parsed)
-    except Exception:
-        pass
-    return None
-
-def parse_date_string(s: Optional[str]) -> Optional[str]:
-    return try_parse_iso(s) if s else None
-
-def date_within_max_age(iso_date: Optional[str]) -> bool:
-    if not iso_date:
-        return True
-    try:
-        dt = datetime.fromisoformat(iso_date)
-        now = datetime.now(dt.tzinfo or timezone.utc)
-        return now - dt <= timedelta(days=MAX_AGE_DAYS)
-    except Exception:
-        return True
-
-def display_date(iso_date: Optional[str]) -> str:
-    if not iso_date:
-        return ""
-    try:
-        dt = datetime.fromisoformat(iso_date)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return iso_date
-
-# --- Robots -> sitemap discovery ---
-def get_robots_sitemaps(base_url: str) -> List[str]:
-    try:
-        robots_url = urljoin(base_url, "/robots.txt")
-        r = session_no_retry.get(robots_url, timeout=6)
-        if r.status_code != 200:
-            log.debug("robots.txt not available (%s): %s", robots_url, r.status_code)
-            return []
-        sitemaps: List[str] = []
-        for line in r.text.splitlines():
-            line = line.strip()
-            if line.lower().startswith("sitemap:"):
-                s = line.split(":", 1)[1].strip()
-                if s:
-                    sitemaps.append(s)
-        log.info("robots.txt sitemaps: %s", sitemaps)
-        return sitemaps
-    except Exception:
-        log.exception("Failed to fetch robots.txt")
-        return []
-
-def parse_sitemap_urls(sitemap_url: str) -> List[Dict]:
-    """
-    Parse a sitemap or sitemap-index and return list of dicts:
-    - if urlset: list of {"loc", "lastmod", "title"}
-    - if sitemapindex: list of {"loc": sitemap_url, "lastmod": ""}
-    Use session_no_retry to avoid long retry backoffs.
-    """
-    try:
-        r = session_no_retry.get(sitemap_url, timeout=8)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        items: List[Dict] = []
-
-        # url entries
-        for url_el in root.findall('.//{*}url'):
-            loc_el = url_el.find('.//{*}loc') or url_el.find('loc')
-            if loc_el is None:
-                continue
-            loc = (loc_el.text or "").strip()
-            if not loc:
-                continue
-            lastmod_el = url_el.find('.//{*}lastmod') or url_el.find('lastmod')
-            lastmod = (lastmod_el.text or "").strip() if lastmod_el is not None else ""
-            news_title_el = url_el.find('.//{http://www.google.com/schemas/sitemap-news/}title')
-            title = news_title_el.text.strip() if (news_title_el is not None and news_title_el.text) else ""
-            items.append({"loc": loc, "lastmod": lastmod, "title": title})
-
-        # sitemap index entries
-        if not items:
-            for sm in root.findall('.//{*}sitemap'):
-                loc_el = sm.find('.//{*}loc') or sm.find('loc')
-                if loc_el is None:
-                    continue
-                loc = (loc_el.text or "").strip()
-                if loc:
-                    items.append({"loc": loc, "lastmod": "", "title": ""})
-
-        # fallback any loc
-        if not items:
-            for loc_el in root.findall('.//{*}loc'):
-                if loc_el is None:
-                    continue
-                loc_text = (loc_el.text or "").strip()
-                if loc_text:
-                    items.append({"loc": loc_text, "lastmod": "", "title": ""})
-
-        return items
-    except Exception:
-        log.exception("Failed to parse sitemap %s", sitemap_url)
-        return []
-
-# --- Page title & date extraction (use no-retry session) ---
-def fetch_title_and_date_from_page(url: str) -> Tuple[str, Optional[str]]:
-    title = ""
-    date_iso = None
-    try:
-        r = session_no_retry.get(url, timeout=8)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        h1 = soup.find("h1")
-        if h1 is not None and h1.get_text(strip=True):
-            title = h1.get_text(strip=True)
-        if not title:
-            og = soup.find("meta", property="og:title")
-            if og is not None and og.get("content"):
-                title = og.get("content").strip()
-        if not title:
-            tt = soup.find("title")
-            if tt is not None and tt.get_text(strip=True):
-                title = tt.get_text(strip=True)
-
-        m = soup.find("meta", {"property": "article:published_time"}) or soup.find("meta", {"name": "article:published_time"})
-        if m is not None and m.get("content"):
-            date_iso = parse_date_string(m.get("content"))
-            return title, date_iso
-
-        for name in ("pubdate", "publishdate", "publish-date", "date", "dc.date", "dc.date.issued", "prpubdate"):
-            m = soup.find("meta", {"name": name})
-            if m is not None and m.get("content"):
-                date_iso = parse_date_string(m.get("content"))
-                if date_iso:
-                    return title, date_iso
-
-        t = soup.find("time")
-        if t is not None:
-            dt = t.get("datetime") or t.get_text()
-            date_iso = parse_date_string(dt)
-            if date_iso:
-                return title, date_iso
-
-        candidates = soup.select(".date, .posted-date, .published, .updated")
-        for c in candidates:
-            txt = c.get_text(strip=True)
-            date_iso = parse_date_string(txt)
-            if date_iso:
-                return title, date_iso
-    except Exception:
-        log.debug("Failed to fetch title/date for %s", url, exc_info=True)
-    return title, date_iso
-
-# --- Robust fetch: feeds -> robots/sitemap -> fallback scrape ---
-def fetch_fda_news() -> List[Dict]:
-    # 1) try known feeds
-    for feed_url in FDA_RSS_CANDIDATES:
-        try:
-            log.debug("Trying feed: %s", feed_url)
-            parsed = feedparser.parse(feed_url)
-            status = getattr(parsed, "status", None)
-            if status and status >= 400:
-                log.warning("Feed %s returned HTTP %s", feed_url, status)
-                continue
-            entries = parsed.get("entries", []) or []
-            if not entries:
-                log.debug("Feed %s returned no entries", feed_url)
-                continue
-            items: List[Dict] = []
-            for e in entries:
-                link = e.get("link") or e.get("id") or ""
-                title = (e.get("title") or "").strip()
-                pub_iso = None
-                if e.get("published_parsed"):
-                    pub_iso = parse_struct_time_to_iso(e.get("published_parsed"))
-                elif e.get("updated_parsed"):
-                    pub_iso = parse_struct_time_to_iso(e.get("updated_parsed"))
-                else:
-                    pub_iso = parse_date_string(e.get("published") or e.get("updated") or "")
-                published = pub_iso or ""
-                uid = e.get("id") or link or (title + "|" + published)
-                if not link:
-                    continue
-                items.append({"uid": uid, "title": title, "link": link, "date": published})
-            if items:
-                log.info("Fetched %d items from feed %s", len(items), feed_url)
-                return items
-        except Exception:
-            log.exception("Error parsing feed %s", feed_url)
-            continue
-
-    # 2) robots.txt -> sitemaps -> parse for press/news urls
-    try:
-        sitemaps = get_robots_sitemaps(FDA_BASE)
-        if not sitemaps:
-            sitemaps = [urljoin(FDA_BASE, "/sitemap.xml"), urljoin(FDA_BASE, "/sitemap_index.xml")]
-        collected: List[Dict] = []
-        inspected = 0
-
-        for sm in sitemaps:
-            entries = parse_sitemap_urls(sm)
-            if not entries:
-                continue
-
-            # if sitemap index returned sub-sitemaps, parse them
-            sitemap_locs = [e["loc"] for e in entries if e.get("loc", "").lower().endswith(".xml")]
-            if sitemap_locs:
-                for sub in sitemap_locs:
-                    sub_entries = parse_sitemap_urls(sub)
-                    if sub_entries:
-                        entries.extend(sub_entries)
-
-            for e in entries:
-                loc = e.get("loc") or ""
-                if not loc:
-                    continue
-                inspected += 1
-                low = loc.lower()
-                if any(k in low for k in ("press", "press-release", "press-announcement", "press-announcements", "press-releases", "news-events", "/news-","/news/","/press/")):
-                    collected.append(e)
-            if collected:
-                break
-
-        log.info("Sitemap inspection: inspected %d urls, collected %d candidate news urls", inspected, len(collected))
-
-        if collected:
-            items: List[Dict] = []
-            for e in collected[:SITEMAP_TITLE_FETCH_LIMIT]:
-                loc = e.get("loc")
-                title = e.get("title") or ""
-                lastmod = e.get("lastmod") or ""
-                lastmod_iso = parse_date_string(lastmod) or ""
-                if not title or not lastmod_iso:
-                    # be polite: small pause and use no-retry session for page fetch
-                    try:
-                        t, d = fetch_title_and_date_from_page(loc)
-                        if not title:
-                            title = t
-                        if not lastmod_iso and d:
-                            lastmod_iso = d
-                    except Exception:
-                        log.debug("Failed to fetch title/date for sitemap item %s", loc, exc_info=True)
-                    time.sleep(0.25)
-                uid = loc
-                items.append({"uid": uid, "title": title, "link": loc, "date": lastmod_iso})
-            if items:
-                log.info("Discovered %d items from sitemap", len(items))
-                return items
-    except Exception:
-        log.exception("Sitemap processing failed")
-
-    # 3) fallback scrapes
-    try:
-        fallback_paths = [
-            "/news-events/press-announcements",
-            "/news-events/press-releases",
-            "/news-events",
-            "/about-fda/press-releases",
-            "/press-announcements"
-        ]
-        for path in fallback_paths:
-            fallback = urljoin(FDA_BASE, path)
-            log.info("Trying fallback scrape: %s", fallback)
-            r = session_no_retry.get(fallback, timeout=8)
-            if r.status_code >= 400:
-                log.debug("Fallback page returned status %s for %s", r.status_code, fallback)
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            results: List[Dict] = []
-            for a in soup.select("article a, .views-row a, .teaser a, a[href*='/news-events/'], a[href*='/press-']"):
-                href = a.get("href")
-                title = (a.get_text() or "").strip()
-                if not href or not title:
-                    continue
-                full = href if href.startswith("http") else urljoin(FDA_BASE, href)
+            items=rconn.hgetall("seen_map") or {}
+            for k,v in items.items():
                 try:
-                    t, d = fetch_title_and_date_from_page(full)
-                except Exception:
-                    t, d = "", None
-                final_title = title if title else t
-                results.append({"uid": full, "title": final_title, "link": full, "date": d or ""})
-            if results:
-                log.info("Scraped %d items from fallback %s", len(results), fallback)
-                return results
-    except Exception:
-        log.exception("Fallback scrape failed")
+                    ts=float(v)
+                    if now-ts<=SEEN_TTL: seen[k]=ts
+                except: continue
+            return seen
+        except: return {}
+    else:
+        try:
+            with open(SEEN_FILE,"r",encoding="utf-8") as f:
+                data=json.load(f)
+                if isinstance(data,dict):
+                    for k,v in data.items():
+                        try:
+                            ts=float(v)
+                            if now-ts<=SEEN_TTL: seen[k]=ts
+                        except: continue
+            return seen
+        except: return {}
+def save_seen(seen:Dict[str,float]):
+    if use_redis and rconn:
+        try:
+            tmp="seen_map_tmp"
+            if seen:
+                rconn.delete(tmp)
+                mapping={k:str(v) for k,v in seen.items()}
+                rconn.hset(tmp,mapping=mapping)
+                rconn.rename(tmp,"seen_map")
+            else: rconn.delete("seen_map")
+        except: pass
+    else:
+        try:
+            tmp=SEEN_FILE+".tmp"
+            with open(tmp,"w",encoding="utf-8") as f: json.dump(seen,f)
+            os.replace(tmp,SEEN_FILE)
+        except: pass
+def mark_seen(seen:Dict[str,float],url:str): seen[url]=time.time()
 
-    log.warning("No FDA news found by any method")
-    return []
+# --- Telegram ---
+def send_telegram(msg:str)->bool:
+    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML","disable_web_page_preview":False}
+    try:
+        r=session.post(url,json=payload,timeout=10)
+        r.raise_for_status()
+        return True
+    except: return False
 
-# --- Format message ---
-def format_msg(item: Dict) -> str:
-    title = html.escape(item.get("title") or "No title")
-    link = html.escape(item.get("link") or "")
-    date = display_date(item.get("date") or "")
-    return (
-        f"🔔 <b>FDA</b>\n"
-        f"📰 <b>{title}</b>\n"
-        f"📅 {html.escape(date)}\n"
-        f"🔗 <a href=\"{link}\">Batafsil</a>"
-    )
+# --- Polygon helpers ---
+def get_price_prev(ticker:str)->Optional[float]:
+    try:
+        r=session.get(f"https://api.polygon.io/v2/aggs/ticker/{ticker.upper()}/prev",params={"apiKey":POLYGON_API_KEY},timeout=10)
+        r.raise_for_status()
+        j=r.json()
+        close=j.get("results",[{}])[0].get("c")
+        return float(close) if close else None
+    except: return None
 
-# --- Main loop ---
+def get_15min_candle(ticker:str):
+    try:
+        url=f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/15/minute/2026-01-01/2026-01-08"
+        r=session.get(url,params={"apiKey":POLYGON_API_KEY},timeout=10)
+        r.raise_for_status()
+        j=r.json()
+        return j.get("results",[])
+    except: return []
+
+def has_volume_spike(candles:list)->bool:
+    if not candles: return False
+    vols=[c.get("v",0) for c in candles[:-1]]
+    last=candles[-1].get("v",0)
+    avg=sum(vols)/len(vols) if vols else 0
+    return last>VOLUME_MULT*avg if avg>0 else False
+
+def fetch_news(ticker:str)->list:
+    q=f'"{ticker}" AND ({" OR ".join(KEYWORDS)})'
+    try:
+        r=session.get("https://api.polygon.io/v2/reference/news",params={"query":q,"limit":PAGE_SIZE_NEWS,"apiKey":POLYGON_API_KEY},timeout=12)
+        r.raise_for_status()
+        j=r.json()
+        return j.get("results",[])
+    except: return []
+
+def is_relevant(article:dict)->bool:
+    text=(article.get("title","")+" "+article.get("summary","")+" "+article.get("description","")).lower()
+    return any(kw.lower() in text for kw in KEYWORDS)
+
+def format_msg(ticker:str,price:float,article:dict)->str:
+    url=article.get("article_url") or article.get("url") or ""
+    title=article.get("title") or article.get("headline") or ""
+    source=article.get("publisher",{}).get("name","") if isinstance(article.get("publisher",{}),dict) else article.get("publisher","")
+    pub=article.get("published_utc","")
+    dt=try_parse_date(pub)
+    pub_str=dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if dt else pub
+    msg=f"🚨 <b>{ticker}</b> <code>${price:.2f}</code>\n📰 <b>{html.escape(title)}</b>\nSource: {html.escape(source)}\nPublished: {html.escape(pub_str)}\n{url}"
+    return msg
+
+# --- Main ---
 def main():
-    log.info("FDA news try")
-
-    # startup ping
-    try:
-        send_telegram("🚀 <b>FDA bot ishga tushdi</b>")
-    except Exception:
-        log.exception("Startup telegram failed")
-
-    first_run = not os.path.exists(SEEN_FILE)
-    seen = load_seen()
-
-    # Bootstrap: if first run and INITIAL_RUN_SEND is False, mark current items as seen (do not send)
-    if first_run and not INITIAL_RUN_SEND:
+    logger.info("penny_news_volume_bot starting")
+    seen=load_seen()
+    while True:
         try:
-            items = fetch_fda_news()
-            count = 0
-            for it in items:
-                uid = it.get("uid")
-                if uid:
-                    seen.add(uid)
-                    count += 1
-            save_seen_atomic(seen)
-            log.info("Bootstrap: marked %d existing items as seen (no messages sent). Set INITIAL_RUN_SEND=true to override.", count)
-        except Exception:
-            log.exception("Bootstrap failed")
+            # Scan tickers
+            r=session.get("https://api.polygon.io/v3/reference/tickers",params={"market":"stocks","active":"true","limit":MAX_CHECK,"apiKey":POLYGON_API_KEY},timeout=15)
+            r.raise_for_status()
+            tickers=r.json().get("results",[])
+            for t in tickers:
+                sym=t.get("ticker")
+                if not sym: continue
+                price=get_price_prev(sym)
+                if price is None or price>PRICE_THRESHOLD: continue
+                candles=get_15min_candle(sym)
+                if not has_volume_spike(candles): continue
+                # Fetch news
+                news=fetch_news(sym)
+                for art in news:
+                    url=art.get("article_url") or art.get("url") or ""
+                    if not url: continue
+                    norm=normalize_url(url)
+                    if seen.get(norm): continue
+                    if not is_relevant(art): continue
+                    msg=format_msg(sym,price,art)
+                    if send_telegram(msg):
+                        mark_seen(seen,norm)
+                save_seen(seen)
+        except Exception as e:
+            logger.exception("Error in main loop")
+        time.sleep(POLL_INTERVAL)
 
-    while not STOP:
-        try:
-            items = fetch_fda_news()
-
-            # prefer items with date (newest first)
-            def sort_key(it: Dict):
-                d = it.get("date") or ""
-                try:
-                    return datetime.fromisoformat(d)
-                except Exception:
-                    return datetime.min
-            items_sorted = sorted(items, key=sort_key, reverse=True)
-
-            for it in items_sorted:
-                uid = it.get("uid")
-                if not uid or uid in seen:
-                    continue
-
-                date_iso = it.get("date") or None
-                if date_iso and not date_within_max_age(date_iso):
-                    log.info("Skipping uid=%s because older than %d days (date=%s)", uid, MAX_AGE_DAYS, date_iso)
-                    seen.add(uid)
-                    save_seen_atomic(seen)
-                    continue
-
-                msg = format_msg(it)
-                sent = send_telegram(msg)
-
-                if sent:
-                    seen.add(uid)
-                    save_seen_atomic(seen)
-                else:
-                    log.warning("Telegram send failed for uid=%s; will retry next run", uid)
-
-            # sleep with early exit
-            slept = 0
-            while slept < POLL_INTERVAL and not STOP:
-                time.sleep(1)
-                slept += 1
-
-        except Exception:
-            log.exception("Main loop error")
-            for _ in range(5):
-                if STOP:
-                    break
-                time.sleep(1)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
