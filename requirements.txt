@@ -13,3 +13,10 @@ lxml>=4.9
 urllib3>=1.26
 python-dotenv>=1.0
 deep-translator
+requests
+pandas
+numpy
+ta
+yfinance
+beautifulsoup4
+lxml
