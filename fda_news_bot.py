@@ -1,207 +1,143 @@
-#!/usr/bin/env python3
-import os
 import time
-import json
-import html
-import logging
-from datetime import datetime
-from typing import Dict, List
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-
+import re
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from deep_translator import GoogleTranslator
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from bs4 import BeautifulSoup
+from datetime import datetime
 
 # ================== CONFIG ==================
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SCAN_INTERVAL = 300  # 5 минута
+MIN_PRICE = 0.3
+MAX_PRICE = 10
 
-PRICE_THRESHOLD = 8.0
-POLL_INTERVAL = 300
-MAX_TICKERS = 200
-NEWS_LIMIT = 10
-SEEN_FILE = "seen_articles.json"
+MIN_REDDIT_MENTIONS = 3
+MIN_SCORE = 7
 
-# ================== LOG ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger("penny_news_uz_bot")
+TELEGRAM_TOKEN = "PUT_YOUR_TOKEN"
+TELEGRAM_CHAT_ID = "PUT_YOUR_CHAT_ID"
 
-# ================== HTTP ==================
-session = requests.Session()
-session.mount(
-    "https://",
-    HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1))
-)
-session.headers.update({"User-Agent": "penny-news-uz-bot/1.0"})
-
-# ================== TRANSLATOR ==================
-translator = GoogleTranslator(source="en", target="uz")
-
-def uzbek(text: str) -> str:
-    try:
-        return translator.translate(text)
-    except Exception:
-        return text
-
-def short_ai_summary_uz(title: str) -> str:
-    try:
-        prompt = f"Бир жумла билан трейдер учун хулоса қилиб бер: {title}"
-        return translator.translate(prompt)
-    except Exception:
-        return title
-
-# ================== KEYWORDS ==================
-KEYWORDS = [
-    "earnings", "revenue", "guidance",
-    "fda", "approval", "trial", "phase",
-    "merger", "acquisition",
-    "offering", "registered direct",
-    "contract", "partnership",
-    "trading halt", "reverse split",
-    "nasdaq", "nyse", "compliance"
+SUBREDDITS = [
+    "pennystocks",
+    "stocks",
+    "wallstreetbets"
 ]
 
-BAD_WORDS = [
-    "market size", "industry report",
-    "global market", "forecast",
-    "research report", "cagr"
-]
-
-# ================== UTILS ==================
-def normalize_url(u: str) -> str:
-    p = urlparse(u)
-    qs = parse_qs(p.query)
-    clean = {k: v for k, v in qs.items() if not k.startswith("utm_")}
-    return urlunparse(p._replace(query=urlencode(clean, doseq=True)))
-
-def load_seen() -> Dict[str, float]:
-    if not os.path.exists(SEEN_FILE):
-        return {}
-    with open(SEEN_FILE, "r") as f:
-        return json.load(f)
-
-def save_seen(seen: Dict[str, float]):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(seen, f)
-
-# ================== FILTERS ==================
-def is_relevant(article: dict) -> bool:
-    text = (article.get("title","") + article.get("summary","")).lower()
-    return any(k in text for k in KEYWORDS)
-
-def is_bad(article: dict) -> bool:
-    text = (article.get("title","") + article.get("summary","")).lower()
-    return any(b in text for b in BAD_WORDS)
-
-def article_matches_symbol(article: dict, symbol: str, company: str) -> bool:
-    text = (article.get("title","") + article.get("summary","")).lower()
-    if f" {symbol.lower()} " in f" {text} ":
-        return True
-    if company and company.lower() in text:
-        return True
-    return False
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 # ================== TELEGRAM ==================
-def send_telegram(msg: str):
+def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
+    data = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "text": text
     }
-    session.post(url, json=payload, timeout=10)
+    requests.post(url, data=data, timeout=10)
 
-# ================== POLYGON ==================
-def get_penny_tickers() -> List[tuple]:
-    url = "https://api.polygon.io/v3/reference/tickers"
-    params = {
-        "market": "stocks",
-        "active": "true",
-        "limit": MAX_TICKERS,
-        "apiKey": POLYGON_API_KEY
-    }
-    r = session.get(url, params=params, timeout=15)
-    data = r.json().get("results", [])
+# ================== INDICATORS ==================
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-    result = []
-    for t in data:
-        price = t.get("last_trade", {}).get("p")
-        if price and price <= PRICE_THRESHOLD:
-            result.append((t["ticker"], t.get("name",""), price))
-    return result
+def macd(series):
+    ema12 = series.ewm(span=12).mean()
+    ema26 = series.ewm(span=26).mean()
+    macd_line = ema12 - ema26
+    signal = macd_line.ewm(span=9).mean()
+    return macd_line, signal
 
-def fetch_news(symbol: str) -> List[dict]:
-    url = "https://api.polygon.io/v2/reference/news"
-    params = {
-        "query": symbol,
-        "limit": NEWS_LIMIT,
-        "apiKey": POLYGON_API_KEY
-    }
-    r = session.get(url, params=params, timeout=15)
-    return r.json().get("results", [])
+# ================== TECH ANALYSIS ==================
+def technical_score(ticker):
+    try:
+        df = yf.download(ticker, period="3mo", interval="1d", progress=False)
+        if df.empty:
+            return 0, None
 
-# ================== FORMAT ==================
-def format_message(symbol, price, article):
-    title_en = article.get("title","")
-    title_uz = uzbek(title_en)
-    ai_uz = short_ai_summary_uz(title_en)
+        price = df["Close"].iloc[-1]
+        if price < MIN_PRICE or price > MAX_PRICE:
+            return 0, None
 
-    source = article.get("publisher",{}).get("name","")
-    published = article.get("published_utc","")
-    link = article.get("article_url","")
+        score = 0
 
-    return (
-        f"🚨 <b>{symbol}</b>  <code>${price:.2f}</code>\n\n"
-        f"📰 <b>{html.escape(title_uz)}</b>\n\n"
-        f"🧠 <i>{html.escape(ai_uz)}</i>\n\n"
-        f"🏢 Манба: {html.escape(source)}\n"
-        f"⏰ Вақт: {published}\n\n"
-        f"🔗 {html.escape(link)}"
-    )
+        r = rsi(df["Close"]).iloc[-1]
+        macd_line, macd_signal = macd(df["Close"])
 
-# ================== MAIN ==================
+        ema9 = df["Close"].ewm(span=9).mean().iloc[-1]
+        ema21 = df["Close"].ewm(span=21).mean().iloc[-1]
+
+        vol_now = df["Volume"].iloc[-1]
+        vol_avg = df["Volume"].rolling(20).mean().iloc[-1]
+
+        if r < 35:
+            score += 2
+        if macd_line.iloc[-1] > macd_signal.iloc[-1]:
+            score += 2
+        if ema9 > ema21:
+            score += 2
+        if vol_now > vol_avg * 2:
+            score += 2
+
+        return score, round(price, 2)
+
+    except Exception:
+        return 0, None
+
+# ================== REDDIT SCAN ==================
+def reddit_mentions():
+    mentions = {}
+
+    for sub in SUBREDDITS:
+        url = f"https://www.reddit.com/r/{sub}/new/"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        titles = soup.find_all("h3")
+        for t in titles:
+            words = re.findall(r"\b[A-Z]{2,5}\b", t.text)
+            for w in words:
+                mentions[w] = mentions.get(w, 0) + 1
+
+    return mentions
+
+# ================== MAIN LOOP ==================
 def main():
-    logger.info("UZ Penny News Bot started")
-    send_telegram("🚀 Узбек Penny News Bot ишга тушди")
-
-    seen = load_seen()
+    send_telegram("🚀 Scanner ишга тушди")
 
     while True:
         try:
-            tickers = get_penny_tickers()
-            for symbol, company, price in tickers:
-                news = fetch_news(symbol)
-                for art in news:
-                    url = art.get("article_url")
-                    if not url:
-                        continue
+            reddit = reddit_mentions()
 
-                    norm = normalize_url(url)
-                    if norm in seen:
-                        continue
-                    if is_bad(art):
-                        continue
-                    if not is_relevant(art):
-                        continue
-                    if not article_matches_symbol(art, symbol, company):
-                        continue
+            for ticker, count in reddit.items():
+                if count < MIN_REDDIT_MENTIONS:
+                    continue
 
-                    msg = format_message(symbol, price, art)
+                tech_score, price = technical_score(ticker)
+                total_score = tech_score + min(count, 4)
+
+                if total_score >= MIN_SCORE:
+                    msg = (
+                        f"🤑 SIGNAL\n"
+                        f"Ticker: {ticker}\n"
+                        f"Price: ${price}\n"
+                        f"Tech score: {tech_score}\n"
+                        f"Reddit mentions: {count}\n"
+                        f"Total score: {total_score}\n"
+                        f"Time: {datetime.utcnow()}"
+                    )
                     send_telegram(msg)
 
-                    seen[norm] = time.time()
-                    save_seen(seen)
+            time.sleep(SCAN_INTERVAL)
 
-        except Exception:
-            logger.exception("ERROR")
-
-        time.sleep(POLL_INTERVAL)
+        except Exception as e:
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
