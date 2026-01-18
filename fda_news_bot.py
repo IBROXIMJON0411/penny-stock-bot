@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import requests
- asimport yfinance as yf
+import yfinance as yf
 
 # Optional translator
 try:
