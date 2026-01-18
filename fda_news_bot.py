@@ -7,7 +7,7 @@ import html
 import logging
 import tempfile
 from typing import List, Dict, Optional, Any
-from __future__ import annotations
+
 
 import requests
 import pandas as pd
