@@ -70,21 +70,32 @@ def fetch_price_data(symbol: str, period="30d", interval="1d") -> Optional[pd.Da
 def calculate_indicators(df: pd.DataFrame) -> Dict[str, float]:
     indicators = {}
     close = df["Close"]
+
     indicators["SMA_10"] = close.rolling(10).mean().iloc[-1]
     indicators["SMA_50"] = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else None
+
     indicators["EMA_10"] = close.ewm(span=10, adjust=False).mean().iloc[-1]
     indicators["EMA_50"] = close.ewm(span=50, adjust=False).mean().iloc[-1] if len(close) >= 50 else None
+
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-    indicators["MACD"] = ema12.iloc[-1] - ema26.iloc[-1]
+    indicators["MACD"] = (ema12 - ema26).iloc[-1]
+
     # RSI
     delta = close.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean().iloc[-1]
-    avg_loss = loss.rolling(14).mean().iloc[-1]
-    indicators["RSI"] = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss != 0 else 100
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    if avg_loss.iloc[-1] == 0:
+        indicators["RSI"] = 100
+    else:
+        rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]
+        indicators["RSI"] = 100 - (100 / (1 + rs))
+
     return indicators
 
 def format_indicator_msg(symbol: str, indicators: Dict[str, float]) -> str:
