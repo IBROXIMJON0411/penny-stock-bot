@@ -4,56 +4,50 @@ import json
 import html
 import logging
 import tempfile
-from typing import List, Dict, Optional, Any, Tuple
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from typing import List, Dict, Optional, Any
+from datetime import datetime
+from __future__ import annotations
 
 import requests
-import yfinance as yf
+import pandas as pd
+
+# Optional: lazy import yfinance only when used
+YFINANCE_AVAILABLE = True
+try:
+    import yfinance as yf
+except Exception:
+    YFINANCE_AVAILABLE = False
 
 # Optional translator
 try:
     from deep_translator import GoogleTranslator
 except Exception:
-    GoogleTranslator = None  # type: ignore
+    GoogleTranslator = None
 
 # ================= CONFIG =================
-@dataclass
-class Config:
-    telegram_token: Optional[str] = os.getenv("TELEGRAM_TOKEN")
-    telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
-    poll_interval: int = int(os.getenv("POLL_INTERVAL", "300"))
-    seen_file: str = os.getenv("SEEN_FILE", "seen.json")
-    tickers_env: Optional[str] = os.getenv("TICKERS")  # comma-separated
-    tickers_file: Optional[str] = os.getenv("TICKERS_FILE")
-    reddit_limit: int = int(os.getenv("REDDIT_LIMIT", "5"))
-    rsi_overbought: float = float(os.getenv("RSI_OVERBOUGHT", "70"))
-    rsi_oversold: float = float(os.getenv("RSI_OVERSOLD", "30"))
-    send_all_indicators: bool = os.getenv("SEND_ALL_INDICATORS", "false").lower() == "true"
-    user_agent: str = os.getenv("USER_AGENT", "DynamicBot/1.0 (+https://example.com)")
-
-cfg = Config()
-
-# Default tickers if none provided
-DEFAULT_TICKERS = ["BTC-USD", "ETH-USD", "AAPL", "TSLA"]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
+SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
+TICKERS_ENV = os.getenv("TICKERS")          # comma-separated tickers
+TICKERS_FILE = os.getenv("TICKERS_FILE")    # path to file with tickers, one per line
+REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "5"))
+RSI_OVERBOUGHT = float_OVERBOUGHT", "70"))
+RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
+SEND_ALL_INDICATORS = os.getenv("SEND_ALL_INDICATORS", "false").lower() == "true"
+USER_AGENT = os.getenv("USER_AGENT", "DynamicBot/1.0 (+https://example.com)")
 
 # ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("dynamic_bot")
 
 # ================= TRANSLATOR =================
-def get_translator():
-    if GoogleTranslator is None:
-        return None
+_translator = None
+if GoogleTranslator is not None:
     try:
-        return GoogleTranslator(source="en", target="uz")
+        _translator = GoogleTranslator(source="en", target="uz")
     except Exception:
-        return None
-
-_translator = get_translator()
+        _translator = None
 
 def uzbek(text: str) -> str:
     if not text:
@@ -62,8 +56,7 @@ def uzbek(text: str) -> str:
         return text
     try:
         return _translator.translate(text)
-    except Exception as e:
-        logger.debug("Translator error: %s", e)
+    except Exception:
         return text
 
 # ================= HTTP SESSION with retries =================
@@ -76,7 +69,7 @@ def create_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": cfg.user_agent})
+    session.headers.update({"User-Agent": USER_AGENT})
     return session
 
 SESSION = create_session()
@@ -92,17 +85,13 @@ def load_seen(path: str) -> Dict[str, float]:
                 return {k: float(v) for k, v in data.items()}
             return {}
     except Exception as e:
-        logger.warning("Failed to load seen file %s: %s", path, e)
+        logger.warning("Failed to load seen file %s", path, e)
         return {}
 
 def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
     try:
         dirpath = os.path.dirname(path) or "."
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=dirpath, encoding="utf-8") as tf:
-            json.dump(seen, tf, ensure_ascii=False, indent=2)
-            tmpname = tf.name
-        os.replace(tmpname, path)
-    except Exception as e:
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=dirpath, encoding="utf-8") as e:
         logger.exception("Failed to save seen file: %s", e)
 
 def mark_seen(seen: Dict[str, float], key: str) -> None:
@@ -110,12 +99,12 @@ def mark_seen(seen: Dict[str, float], key: str) -> None:
 
 # ================= TELEGRAM =================
 def send_telegram(msg: str) -> bool:
-    if not cfg.telegram_token or not cfg.telegram_chat_id:
-        logger.warning("Telegram token or chat id not configured, skipping send.")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram token or chat id not configured; skipping send.")
         return False
-    url = f"https://api.telegram.org/bot{cfg.telegram_token}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-        "chat_id": cfg.telegram_chat_id,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
         "parse_mode": "HTML",
         "disable_web_page_preview": False
@@ -132,29 +121,30 @@ def send_telegram(msg: str) -> bool:
         logger.exception("Telegram send error: %s", e)
         return False
 
-# ================= HELPERS =================
+# ================= TICKER LOADING (NO DEFAULT TICKERS) =================
 def load_tickers() -> List[str]:
     tickers: List[str] = []
-    if cfg.tickers_env:
-        tickers = [t.strip() for t in cfg.tickers_env.split(",") if t.strip()]
-    elif cfg.tickers_file and os.path.exists(cfg.tickers_file):
+    if TICKERS_ENV:
+        tickers = [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
+    elif TICKERS_FILE and os.path.exists(TICKERS_FILE):
         try:
-            with open(cfg.tickers_file, "r", encoding="utf-8") as f:
+            with open(TICKERS_FILE, "r", encoding="utf-8") as f:
                 tickers = [line.strip() for line in f if line.strip()]
         except Exception as e:
             logger.warning("Failed to load tickers from file: %s", e)
-    if not tickers:
-        tickers = DEFAULT_TICKERS
+    # Intentionally do NOT provide default tickers here
     return tickers
 
 # ================= TECHNICAL INDICATORS =================
 def fetch_price_data(symbol: str, period: str = "60d", interval: str = "1d") -> Optional[pd.DataFrame]:
+    if not YFINANCE_AVAILABLE:
+        logger.error("yfinance is not available (not installed). Cannot fetch price data for %s", symbol)
+        return None
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
         if df is None or df.empty:
             logger.debug("No price data for %s", symbol)
             return None
-        # Ensure index is datetime and sorted
         df = df.sort_index()
         return df
     except Exception as e:
@@ -162,26 +152,21 @@ def fetch_price_data(symbol: str, period: str = "60d", interval: str = "1d") -> 
         return None
 
 def calculate_indicators(df: pd.DataFrame) -> Dict[str, Optional[float]]:
-    out: Dict[str, Optional[float]] = {}
+    out: Dict[str, Optional[float = {}
     close = df["Close"].dropna()
     n = len(close)
     if n == 0:
         return out
-    # Simple moving averages
+    out["LAST"] = float(close.iloc[-1])
     out["SMA_10"] = float(close.rolling(10).mean().iloc[-1]) if n >= 10 else None
     out["SMA_50"] = float(close.rolling(50).mean().iloc[-1]) if n >= 50 else None
-    # Exponential moving averages
     out["EMA_10"] = float(close.ewm(span=10, adjust=False).mean().iloc[-1]) if n >= 1 else None
     out["EMA_50"] = float(close.ewm(span=50, adjust=False).mean().iloc[-1]) if n >= 50 else None
-    # MACD: 12-26 EMA and signal 9
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     out["MACD"] = float(macd.iloc[-1]) if len(macd) >= 1 else None
-    # MACD Signal
-    signal = macd.ewm(span=9, adjust=False).mean()
-    out["MACD_SIGNAL"] = float(signal.iloc[-1]) if len(signal) >= 1 else None
-    # RSI (Wilder's smoothing approximation using simple rolling for first pass)
+    out["MACD_SIGNAL"] = float(macd.ewm(span=9, adjust=False).mean().iloc[-1]) if len(macd) >= 1 else None
     delta = close.diff().dropna()
     if len(delta) >= 14:
         gain = delta.where(delta > 0, 0.0)
@@ -196,8 +181,6 @@ def calculate_indicators(df: pd.DataFrame) -> Dict[str, Optional[float]]:
         out["RSI"] = float(rsi)
     else:
         out["RSI"] = None
-    # Last close
-    out["LAST"] = float(close.iloc[-1])
     return out
 
 def format_indicator_msg(symbol: str, indicators: Dict[str, Optional[float]]) -> str:
@@ -206,32 +189,24 @@ def format_indicator_msg(symbol: str, indicators: Dict[str, Optional[float]]) ->
         v = indicators.get(k)
         if v is None:
             continue
-        if k in ("RSI",):
+        if k == "RSI":
             lines.append(f"{k}: {v:.2f}")
         else:
-            lines.append(f"{k}: {v:.4f}" if isinstance(v, float) and abs(v) >= 0.0001 else f"{k}: {v}")
+            lines.append(f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}")
     return "\n".join(lines)
 
-# ================= SIGNAL DETECTION =================
-def detect_signals(symbol: str, df: pd.DataFrame, indicators: Dict[str, Optional[float]]) -> List[str]:
-    """
-    Generate human-readable signal messages for a ticker.
-    Simple signals implemented:
-      - SMA10 cross above/below SMA50 (if SMA50 exists)
-      - EMA10 cross above/below EMA50 (if EMA50 exists)
-      - MACD crossing its signal line
-      - RSI overbought/oversold
-    """
+def detect_signals(df: pd.DataFrame, indicators: Dict[str, Optional[float]]) -> List[str]:
     signals: List[str] = []
     close = df["Close"].dropna()
     if len(close) < 2:
         return signals
 
-    # Helper to detect cross based on moving series
     def cross(series_a: pd.Series, series_b: pd.Series) -> Optional[str]:
         if len(series_a) < 2 or len(series_b) < 2:
             return None
-        a_prev, a_now = series_a.iloc[-2],(a_now) or pd.isna(b_prev) or pd.isna(b_now):
+        a_prev, a_now = series_a.iloc[-2], series_a.iloc[-1]
+        b_prev, b_now = series_b.iloc[-2], series_b.iloc[-1]
+        if pd.isna(a_prev) or pd.isna(a_now) or pd.isna(b_prev) or pd.isna(b_now):
             return None
         if a_prev <= b_prev and a_now > b_now:
             return "bull_cross"
@@ -239,7 +214,9 @@ def detect_signals(symbol: str, df: pd.DataFrame, indicators: Dict[str, Optional
             return "bear_cross"
         return None
 
-).mean()
+    # SMA cross if enough data
+    if len(close) >= 50:
+        sma10 = close.rolling(10).mean()
         sma50 = close.rolling(50).mean()
         res = cross(sma10, sma50)
         if res == "bull_cross":
@@ -256,8 +233,8 @@ def detect_signals(symbol: str, df: pd.DataFrame, indicators: Dict[str, Optional
     elif res == "bear_cross":
         signals.append("EMA(10) crossed below EMA(50) — bearish")
 
-    # MACD cross signal
-    macd = (close.ewm(span=12()ewm(span=26, adjust=False).mean())
+    # MACD cross
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
     macd_signal = macd.ewm(span=9, adjust=False).mean()
     res = cross(macd, macd_signal)
     if res == "bull_cross":
@@ -265,12 +242,11 @@ def detect_signals(symbol: str, df: pd.DataFrame, indicators: Dict[str, Optional
     elif res == "bear_cross":
         signals.append("MACD crossed below its signal line — bearish momentum")
 
-    # RSI thresholds
     rsi = indicators.get("RSI")
     if rsi is not None:
-        if rsi >= cfg.rsi_overbought:
+        if rsi >= RSI_OVERBOUGHT:
             signals.append(f"RSI {rsi:.1f} — overbought")
-        elif rsi <= cfg.rsi_oversold:
+        elif rsi <= RSI_OVERSOLD:
             signals.append(f"RSI {rsi:.1f} — oversold")
 
     return signals
@@ -284,8 +260,7 @@ def build_signal_message(symbol: str, indicators: Dict[str, Optional[float]], si
 
 # ================= SOCIAL DISCUSSION =================
 SOCIAL_SOURCES = [
-    {"name": "Reddit", "url": "https://www.reddit.com/r/CryptoCurrency/new/.json?limit={limit}".format(limit=cfg.reddit_limit)},
-    # Add other sources here as needed
+    {"name": "Reddit", "url": f"https://www.reddit.com/r/CryptoCurrency/new/.json?limit={REDDIT_LIMIT}"},
 ]
 
 def fetch_social_discussions() -> List[Dict[str, Any]]:
@@ -295,7 +270,6 @@ def fetch_social_discussions() -> List[Dict[str, Any]]:
             r = SESSION.get(src["url"], timeout=10)
             r.raise_for_status()
             j = r.json()
-            # Reddit structure: data -> children -> data
             posts = j.get("data", {}).get("children", [])
             for p in posts:
                 data = p.get("data", {})
@@ -317,7 +291,10 @@ def format_social_msg(post: Dict[str, Any]) -> str:
 # ================= MAIN LOOP =================
 def run_once(seen: Dict[str, float]) -> None:
     tickers = load_tickers()
-    logger.info("Checking tickers: %s", ", ".join(tickers))
+    if tickers:
+        logger.info("Checking tickers: %s", ", ".join(tickers))
+    else:
+        logger.info("No tickers configured (TICKERS or TICKERS_FILE). Skipping price checks.")
 
     for symbol in tickers:
         try:
@@ -326,17 +303,16 @@ def run_once(seen: Dict[str, float]) -> None:
                 logger.debug("No data for %s, skipping", symbol)
                 continue
             indicators = calculate_indicators(df)
-            signals = detect_signals(symbol, df, indicators)
+            signals = detect_signals(df, indicators)
             if signals:
                 msg = build_signal_message(symbol, indicators, signals)
                 if send_telegram(msg):
                     logger.info("Sent signal for %s: %s", symbol, signals)
                 else:
                     logger.warning("Failed to send signal message for %s", symbol)
-            elif cfg.send_all_indicators:
+            elif SEND_ALL_INDICATORS:
                 msg = format_indicator_msg(symbol, indicators)
                 send_telegram(msg)
-            # Sleep a little to avoid API bursts
             time.sleep(0.5)
         except Exception as e:
             logger.exception("Error processing %s: %s", symbol, e)
@@ -347,19 +323,29 @@ def run_once(seen: Dict[str, float]) -> None:
         key = p.get("url") or p.get("title")
         if not key:
             continue
-_atomic(cfg.seen_file, seen)
+        if key in seen:
+            continue
+        msg = format_social_msg(p)
+        if send_telegram(msg):
+            mark_seen(seen, key)
+            save_seen_atomic(SEEN_FILE, seen)
             logger.info("Sent social post from %s: %s", p.get("source"), p.get("url"))
         time.sleep(0.5)
 
 def main() -> None:
     logger.info("Dynamic Bot starting")
-    seen = load_seen(cfg.seen_file)
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram is not fully configured; the bot will run but will not send messages.")
+    if not YFINANCE_AVAILABLE:
+        logger.warning("yfinance not installed. Price/indicator features will be disabled unless yfinance is available.")
+
+    seen = load_seen(SEEN_FILE)
     try:
         while True:
             start = time.time()
             run_once(seen)
             elapsed = time.time() - start
-            sleep_for = max(0.0, cfg.poll_interval - elapsed)
+            sleep_for = max(0.0, POLL_INTERVAL - elapsed)
             logger.debug("Sleeping for %.1f seconds", sleep_for)
             time.sleep(sleep_for)
     except KeyboardInterrupt:
@@ -367,9 +353,8 @@ def main() -> None:
     except Exception as e:
         logger.exception("Fatal error: %s", e)
     finally:
-        # Persist seen before exit
         try:
-            save_seen_atomic(cfg.seen_file, seen)
+            save_seen_atomic(SEEN_FILE, seen)
         except Exception:
             pass
         logger.info("Dynamic Bot stopped")
