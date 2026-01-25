@@ -39,9 +39,10 @@ from urllib3.util.retry import Retry
 
 def create_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5)
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
     adapter = HTTPAdapter(max_retries=retries)
     s.mount("https://", adapter)
+    s.mount("http://", adapter)
     s.headers.update({"User-Agent": USER_AGENT})
     return s
 
@@ -49,33 +50,81 @@ SESSION = create_session()
 
 # ================= SEEN =================
 def load_seen(path: str) -> Dict[str, float]:
+    """
+    Load seen dict from JSON file. Returns empty dict on failure.
+    Ensures values are floats (timestamps) where possible.
+    """
     if not os.path.exists(path):
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+            data = json.load(f)
+            if isinstance(data, dict):
+                out: Dict[str, float] = {}
+                for k, v in data.items():
+                    try:
+                        out[str(k)] = float(v)
+                    except Exception:
+                        out[str(k)] = time.time()
+                return out
+    except Exception as e:
+        logger.warning("Seen файлни юклашда хато: %s", e)
+    return {}
 
 def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
+    """
+    Safely write `seen` dict to `path` atomically.
+
+    - Tries to create target directory if missing.
+    - Writes a temporary file inside the target directory for atomic os.replace.
+    - If target directory cannot be used, falls back to system temp dir and then attempts move.
+    - Cleans up temporary file on failure.
+    """
+    abs_path = os.path.abspath(path)
+    target_dir = os.path.dirname(abs_path) or "."
+
+    tmpname = None
+    # Try to ensure directory exists
     try:
-        dirpath = os.path.dirname(path) or "."
-        os.makedirs(dirpath, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", delete=False, dir=dirpath, encoding="utf-8"
-        ) as tf:
-            json.dump(seen, tf, ensure_ascii=False, indent=2)
-            tmp = tf.name
-        os.replace(tmp, path)
+        os.makedirs(target_dir, exist_ok=True)
     except Exception as e:
-        logger.error("Seen файлни сақлашда хато: %s", e)
+        logger.warning("Directory %s ni yaratib bo'lmadi: %s. Fallback ishlatiladi.", target_dir, e)
+        target_dir = None
+
+    try:
+        if target_dir:
+            # Best effort: create temp file inside target dir for atomic replace
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=target_dir, encoding="utf-8") as tf:
+                json.dump(seen, tf, ensure_ascii=False, indent=2)
+                tmpname = tf.name
+            os.replace(tmpname, abs_path)
+        else:
+            # Fallback: write in system temp then try to move
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+                json.dump(seen, tf, ensure_ascii=False, indent=2)
+                tmpname = tf.name
+            # attempt to create the target dir now (best-effort) before replace
+            try:
+                os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+            except Exception:
+                logger.debug("Target dir still not creatable; os.replace may fail.")
+            os.replace(tmpname, abs_path)
+    except Exception as e:
+        logger.error("Seen save error: %s", e)
+        # cleanup tmp file if left behind
+        try:
+            if tmpname and os.path.exists(tmpname):
+                os.remove(tmpname)
+        except Exception:
+            pass
 
 def mark_seen(seen: Dict[str, float], key: str) -> None:
-    seen[key] = time.time()
+    seen[str(key)] = time.time()
 
 # ================= TELEGRAM =================
 def send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.debug("Telegram конфигурацияси йўқ, хабар юборилмади")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -93,8 +142,11 @@ def load_tickers() -> List[str]:
     if TICKERS_ENV:
         return [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
     if TICKERS_FILE and os.path.exists(TICKERS_FILE):
-        with open(TICKERS_FILE, "r", encoding="utf-8") as f:
-            return [l.strip() for l in f if l.strip()]
+        try:
+            with open(TICKERS_FILE, "r", encoding="utf-8") as f:
+                return [l.strip() for l in f if l.strip()]
+        except Exception as e:
+            logger.warning("Tickers файлни ўқишда хато: %s", e)
     return []
 
 # ================= PRICE & VOLUME =================
@@ -104,23 +156,30 @@ def fetch_price_data(symbol: str) -> Optional[pd.DataFrame]:
         if df is None or df.empty:
             return None
         return df
-    except Exception:
+    except Exception as e:
+        logger.debug("Price fetch error for %s: %s", symbol, e)
         return None
 
 def percent_change(a: float, b: float) -> Optional[float]:
-    if b == 0:
+    try:
+        if b == 0:
+            return None
+        return (a - b) / b * 100
+    except Exception:
         return None
-    return (a - b) / b * 100
 
 def check_volume_price_spike(df: pd.DataFrame) -> Optional[str]:
-    if len(df) < 2:
+    if df is None or len(df) < 2:
         return None
 
     today = df.iloc[-1]
     prev = df.iloc[-2]
 
-    price_change = percent_change(today["Close"], prev["Close"])
-    volume_change = percent_change(today["Volume"], prev["Volume"])
+    try:
+        price_change = percent_change(float(today["Close"]), float(prev["Close"]))
+        volume_change = percent_change(float(today["Volume"]), float(prev["Volume"]))
+    except Exception:
+        return None
 
     if (
         price_change is not None
@@ -130,6 +189,10 @@ def check_volume_price_spike(df: pd.DataFrame) -> Optional[str]:
     ):
         return f"📈 Нарх {price_change:.1f}% ва Volume {volume_change:.1f}% ошди"
 
+    # handle division-by-zero (prev == 0)
+    if price_change is None and volume_change is None and float(today.get("Close", 0)) > 0 and float(today.get("Volume", 0)) > 0:
+        return "📈 Нарх ва Volumeда янги фаолият (илк маълумотлар)"
+
     return None
 
 # ================= REDDIT =================
@@ -138,15 +201,16 @@ def fetch_reddit_discussions():
     posts = []
     try:
         r = SESSION.get(url, timeout=10)
-        data = r.json()["data"]["children"]
+        r.raise_for_status()
+        data = r.json().get("data", {}).get("children", [])
         for p in data:
-            d = p["data"]
+            d = p.get("data", {})
             posts.append({
                 "title": d.get("title", ""),
                 "url": f"https://reddit.com{d.get('permalink', '')}"
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Reddit fetch error: %s", e)
     return posts
 
 # ================= POLYGON NEWS =================
@@ -160,13 +224,14 @@ def fetch_polygon_news(symbol: str):
     news = []
     try:
         r = SESSION.get(url, timeout=10)
+        r.raise_for_status()
         for n in r.json().get("results", []):
             news.append({
                 "title": n.get("title", ""),
-                "url": n.get("article_url", "")
+                "url": n.get("article_url", "") or n.get("url", "")
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Polygon fetch error for %s: %s", symbol, e)
     return news
 
 # ================= MAIN LOOP =================
@@ -193,23 +258,29 @@ def run_once(seen: Dict[str, float]) -> None:
             save_seen_atomic(SEEN_FILE, seen)
 
             for n in fetch_polygon_news(symbol):
-                key = n["url"]
-                if key not in seen:
-                    send_telegram(
-                        f"📰 <b>{html.escape(symbol)}</b>\n"
-                        f"{html.escape(n['title'])}\n{n['url']}"
-                    )
-                    mark_seen(seen, key)
-                    save_seen_atomic(SEEN_FILE, seen)
+                key = n.get("url") or n.get("title")
+                if not key or key in seen:
+                    continue
+                send_telegram(
+                    f"📰 <b>{html.escape(symbol)}</b>\n"
+                    f"{html.escape(n['title'])}\n{html.escape(n['url'])}"
+                )
+                mark_seen(seen, key)
+                save_seen_atomic(SEEN_FILE, seen)
+
+        time.sleep(0.3)
 
     for p in fetch_reddit_discussions():
-        if p["url"] not in seen:
-            send_telegram(
-                f"💬 <b>Reddit муҳокамаси</b>\n"
-                f"{html.escape(p['title'])}\n{p['url']}"
-            )
-            mark_seen(seen, p["url"])
-            save_seen_atomic(SEEN_FILE, seen)
+        key = p.get("url") or p.get("title")
+        if not key or key in seen:
+            continue
+        send_telegram(
+            f"💬 <b>Reddit муҳокамаси</b>\n"
+            f"{html.escape(p['title'])}\n{html.escape(p['url'])}"
+        )
+        mark_seen(seen, key)
+        save_seen_atomic(SEEN_FILE, seen)
+        time.sleep(0.2)
 
 # ================= ENTRY =================
 def main():
@@ -222,9 +293,17 @@ def main():
 
     seen = load_seen(SEEN_FILE)
 
-    while True:
-        run_once(seen)
-        time.sleep(POLL_INTERVAL)
+    try:
+        while True:
+            run_once(seen)
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        logger.info("Бот тўхтатилди (KeyboardInterrupt)")
+    finally:
+        try:
+            save_seen_atomic(SEEN_FILE, seen)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
