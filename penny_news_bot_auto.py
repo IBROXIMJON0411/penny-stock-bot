@@ -6,293 +6,225 @@ import json
 import html
 import logging
 import tempfile
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from urllib.parse import quote_plus
 
 import requests
 import pandas as pd
-import yfinance as yf  # required for price data
+import yfinance as yf
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))  # seconds
-SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
-TICKERS_ENV = os.getenv("TICKERS")       # comma-separated tickers
-TICKERS_FILE = os.getenv("TICKERS_FILE") # file path with tickers (one per line)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
+SEEN_FILE = os.getenv("SEEN_FILE", "./seen.json")
+TICKERS_ENV = os.getenv("TICKERS")
+TICKERS_FILE = os.getenv("TICKERS_FILE")
 REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "5"))
-PRICE_RISE_THRESHOLD = float(os.getenv("PRICE_RISE_THRESHOLD", "5.0"))   # percent
-VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "5.0")) # percent
+PRICE_RISE_THRESHOLD = float(os.getenv("PRICE_RISE_THRESHOLD", "5.0"))
+VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "5.0"))
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-USER_AGENT = os.getenv("USER_AGENT", "VolumeBot/1.0 (+https://example.com)")
+USER_AGENT = os.getenv("USER_AGENT", "VolumeBot/1.0")
 
 # ================= LOGGING =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 logger = logging.getLogger("volume_bot")
 
-# ================= HTTP SESSION with retries =================
+# ================= HTTP SESSION =================
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 def create_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))
+    retries = Retry(total=3, backoff_factor=0.5)
     adapter = HTTPAdapter(max_retries=retries)
     s.mount("https://", adapter)
-    s.mount("http://", adapter)
     s.headers.update({"User-Agent": USER_AGENT})
     return s
 
 SESSION = create_session()
 
-# ================= SEEN TRACKER =================
+# ================= SEEN =================
 def load_seen(path: str) -> Dict[str, float]:
     if not os.path.exists(path):
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return {str(k): float(v) for k, v in data.items()}
-    except Exception as e:
-        logger.warning("Failed to load seen file %s: %s", path, e)
-    return {}
+            return json.load(f)
+    except Exception:
+        return {}
 
 def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
     try:
         dirpath = os.path.dirname(path) or "."
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=dirpath, encoding="utf-8") as tf:
+        os.makedirs(dirpath, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", delete=False, dir=dirpath, encoding="utf-8"
+        ) as tf:
             json.dump(seen, tf, ensure_ascii=False, indent=2)
-            tmpname = tf.name
-        os.replace(tmpname, path)
+            tmp = tf.name
+        os.replace(tmp, path)
     except Exception as e:
-        logger.exception("Failed to save seen file: %s", e)
+        logger.error("Seen файлни сақлашда хато: %s", e)
 
 def mark_seen(seen: Dict[str, float], key: str) -> None:
-    seen[str(key)] = time.time()
+    seen[key] = time.time()
 
 # ================= TELEGRAM =================
-def send_telegram(msg: str) -> bool:
+def send_telegram(msg: str) -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram token or chat id not set; skipping send.")
-        return False
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "parse_mode": "HTML"
     }
     try:
-        r = SESSION.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        j = r.json()
-        ok = bool(j.get("ok", False))
-        if not ok:
-            logger.error("Telegram API returned not-ok: %s", j)
-        return ok
+        SESSION.post(url, json=payload, timeout=10)
     except Exception as e:
-        logger.exception("Telegram send error: %s", e)
-        return False
+        logger.error("Telegram хато: %s", e)
 
 # ================= TICKERS =================
 def load_tickers() -> List[str]:
-    tickers: List[str] = []
     if TICKERS_ENV:
-        tickers = [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
-    elif TICKERS_FILE and os.path.exists(TICKERS_FILE):
-        try:
-            with open(TICKERS_FILE, "r", encoding="utf-8") as f:
-                tickers = [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            logger.warning("Failed to load tickers from file %s: %s", TICKERS_FILE, e)
-    return tickers
+        return [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
+    if TICKERS_FILE and os.path.exists(TICKERS_FILE):
+        with open(TICKERS_FILE, "r", encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip()]
+    return []
 
-# ================= PRICE + VOLUME =================
-def fetch_price_data(symbol: str, period: str = "10d", interval: str = "1d") -> Optional[pd.DataFrame]:
+# ================= PRICE & VOLUME =================
+def fetch_price_data(symbol: str) -> Optional[pd.DataFrame]:
     try:
-        df = yf.download(symbol, period=period, interval=interval, progress=False, threads=False)
+        df = yf.download(symbol, period="10d", interval="1d", progress=False)
         if df is None or df.empty:
-            logger.debug("No price data for %s", symbol)
             return None
-        return df.sort_index()
-    except Exception as e:
-        logger.exception("Failed to fetch price for %s: %s", symbol, e)
-        return None
-
-def _percent_change(now: float, prev: float) -> Optional[float]:
-    try:
-        if prev == 0:
-            return None
-        return (now - prev) / prev * 100.0
+        return df
     except Exception:
         return None
 
-def check_volume_price_spike(df: pd.DataFrame) -> Optional[str]:
-    """
-    Return formatted message if both price and volume exceed thresholds.
-    Returns None otherwise.
-    """
-    if df is None or len(df) < 2:
+def percent_change(a: float, b: float) -> Optional[float]:
+    if b == 0:
         return None
+    return (a - b) / b * 100
+
+def check_volume_price_spike(df: pd.DataFrame) -> Optional[str]:
+    if len(df) < 2:
+        return None
+
     today = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Ensure required columns exist
-    if ("Close" not in today) or ("Volume" not in today) or ("Close" not in prev) or ("Volume" not in prev):
-        return None
+    price_change = percent_change(today["Close"], prev["Close"])
+    volume_change = percent_change(today["Volume"], prev["Volume"])
 
-    try:
-        price_now = float(today["Close"])
-        price_prev = float(prev["Close"])
-        vol_now = float(today["Volume"])
-        vol_prev = float(prev["Volume"])
-    except Exception:
-        return None
-
-    price_change = _percent_change(price_now, price_prev)
-    volume_change = _percent_change(vol_now, vol_prev)
-
-    price_spike = (price_change is not None and price_change >= PRICE_RISE_THRESHOLD)
-    volume_spike = (volume_change is not None and volume_change >= VOLUME_SPIKE_THRESHOLD)
-
-    if price_spike and volume_spike:
-        return f"📈 Price + Volume spike: {price_change:.1f}% / {volume_change:.1f}%"
-
-    # handle division-by-zero case (prev == 0)
-    if price_change is None and volume_change is None and price_now > 0 and vol_now > 0:
-        return "📈 Price + Volume spike (previous=0) — new activity"
+    if (
+        price_change is not None
+        and volume_change is not None
+        and price_change >= PRICE_RISE_THRESHOLD
+        and volume_change >= VOLUME_SPIKE_THRESHOLD
+    ):
+        return f"📈 Нарх {price_change:.1f}% ва Volume {volume_change:.1f}% ошди"
 
     return None
 
-# ================= SOCIAL DISCUSSION (Reddit) =================
-def fetch_reddit_discussions() -> List[Dict[str, str]]:
-    url = f"https://www.reddit.com/r/CryptoCurrency/new/.json?limit={REDDIT_LIMIT}"
-    discussions: List[Dict[str, str]] = []
+# ================= REDDIT =================
+def fetch_reddit_discussions():
+    url = f"https://www.reddit.com/r/stocks/new/.json?limit={REDDIT_LIMIT}"
+    posts = []
     try:
         r = SESSION.get(url, timeout=10)
-        r.raise_for_status()
-        children = r.json().get("data", {}).get("children", [])
-        for p in children:
-            d = p.get("data", {})
-            title = d.get("title") or d.get("selftext") or ""
-            permalink = d.get("permalink")
-            link = f"https://reddit.com{permalink}" if permalink else d.get("url") or ""
-            discussions.append({"source": "Reddit", "title": title, "url": link})
-    except Exception as e:
-        logger.debug("Reddit fetch failed: %s", e)
-    return discussions
-
-def format_social_msg(post: Dict[str, str]) -> str:
-    source = html.escape(post.get("source", ""))
-    title = html.escape(post.get("title", ""))
-    url = html.escape(post.get("url", ""))
-    return f"💬 <b>{source}</b>\n📰 {title}\n{url}"
+        data = r.json()["data"]["children"]
+        for p in data:
+            d = p["data"]
+            posts.append({
+                "title": d.get("title", ""),
+                "url": f"https://reddit.com{d.get('permalink', '')}"
+            })
+    except Exception:
+        pass
+    return posts
 
 # ================= POLYGON NEWS =================
-def fetch_polygon_news(symbol: str) -> List[Dict[str, str]]:
+def fetch_polygon_news(symbol: str):
     if not POLYGON_API_KEY:
         return []
-    query = quote_plus(symbol)
-    url = f"https://api.polygon.io/v2/reference/news?query={query}&limit=5&apiKey={POLYGON_API_KEY}"
-    news_list: List[Dict[str, str]] = []
+    url = (
+        "https://api.polygon.io/v2/reference/news?"
+        f"query={quote_plus(symbol)}&limit=3&apiKey={POLYGON_API_KEY}"
+    )
+    news = []
     try:
         r = SESSION.get(url, timeout=10)
-        r.raise_for_status()
-        results = r.json().get("results", [])
-        for art in results:
-            publisher = art.get("publisher", {}) or {}
-            news_list.append({
-                "source": publisher.get("name", "Polygon"),
-                "title": art.get("title", "") or "",
-                "url": art.get("article_url", "") or art.get("url", "")
+        for n in r.json().get("results", []):
+            news.append({
+                "title": n.get("title", ""),
+                "url": n.get("article_url", "")
             })
-    except Exception as e:
-        logger.debug("Polygon news fetch failed for %s: %s", symbol, e)
-    return news_list
-
-def format_news_msg(article: Dict[str, str]) -> str:
-    source = html.escape(article.get("source", ""))
-    title = html.escape(article.get("title", ""))
-    url = html.escape(article.get("url", ""))
-    return f"📰 <b>{source}</b>\n{title}\n{url}"
+    except Exception:
+        pass
+    return news
 
 # ================= MAIN LOOP =================
 def run_once(seen: Dict[str, float]) -> None:
-   s", ", ".join(tickers))
-    else:
-        logger.info("No tickers configured; skipping price checks")
+    tickers = load_tickers()
+
+    if not tickers:
+        logger.info("Тикерлар берилмаган")
+        return
+
+    logger.info("Кузатилаётган тикерлар: %s", ", ".join(tickers))
 
     for symbol in tickers:
-        try:
-            df = fetch_price_data(symbol)
-            if df is None:
-                continue
-            spike_msg = check_volume_price_spike(df)
-            if spike_msg:
-                msg = f"⚠️ <b>{html.escape(symbol)}</b>\n{html.escape(spike_msg)}"
-                if send_telegram(msg):
-                    logger.info("Sent spike alert for %s", symbol)
-                else:
-                    logger.warning("Failed to send spike alert for %s", symbol)
-                mark_seen(seen, f"spike_{symbol}")
-                save_seen_atomic(SEEN_FILE, seen)
-
-                # Fetch news after spike (if available)
-                news_list = fetch_polygon_news(symbol)
-                for n in news_list:
-                    key = n.get("url") or n.get("title")
-                    if not key or key in seen:
-                        continue
-                    if send_telegram(format_news_msg(n)):
-                        mark_seen(seen, key)
-                        save_seen_atomic(SEEN_FILE, seen)
-                    time.sleep(0.3)
-            time.sleep(0.3)
-        except Exception as e:
-            logger.exception("Error processing %s: %s", symbol, e)
-
-    # Social posts
-    posts = fetch_reddit_discussions()
-    for p in posts:
-        key = p.get("url") or p.get("title")
-        if not key or key in seen:
+        df = fetch_price_data(symbol)
+        if not df:
             continue
-        try:
-            if send_telegram(format_social_msg(p)):
-                mark_seen(seen, key)
-                save_seen_atomic(SEEN_FILE, seen)
-                logger.info("Sent social post: %s", key)
-        except Exception as e:
-            logger.exception("Failed to send social post: %s", e)
-        time.sleep(0.3)
 
-def main() -> None:
-    logger.info("Volume Bot started 🚀")
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not fully configured; bot will run but will not send messages.")
-    if not POLYGON_API_KEY:
-        logger.info("Polygon API key not set; news fetching disabled.")
+        spike = check_volume_price_spike(df)
+        if spike:
+            send_telegram(
+                f"⚠️ <b>{html.escape(symbol)}</b>\n{html.escape(spike)}"
+            )
+            mark_seen(seen, f"spike_{symbol}")
+            save_seen_atomic(SEEN_FILE, seen)
+
+            for n in fetch_polygon_news(symbol):
+                key = n["url"]
+                if key not in seen:
+                    send_telegram(
+                        f"📰 <b>{html.escape(symbol)}</b>\n"
+                        f"{html.escape(n['title'])}\n{n['url']}"
+                    )
+                    mark_seen(seen, key)
+                    save_seen_atomic(SEEN_FILE, seen)
+
+    for p in fetch_reddit_discussions():
+        if p["url"] not in seen:
+            send_telegram(
+                f"💬 <b>Reddit муҳокамаси</b>\n"
+                f"{html.escape(p['title'])}\n{p['url']}"
+            )
+            mark_seen(seen, p["url"])
+            save_seen_atomic(SEEN_FILE, seen)
+
+# ================= ENTRY =================
+def main():
+    logger.info("Бот ишга тушди")
+    send_telegram(
+        "✅ <b>Бот ишга тушди</b>\n"
+        "📊 Volume ва нарх кузатиляпти\n"
+        "📰 Янгиликлар ва Reddit муҳокамалари текширилади"
+    )
 
     seen = load_seen(SEEN_FILE)
-    try:
-        while True:
-            start = time.time()
-            run_once(seen)
-            elapsed = time.time() - start
-            sleep_for = max(0.0, POLL_INTERVAL - elapsed)
-            logger.debug("Sleeping for %.1f seconds", sleep_for)
-            time.sleep(sleep_for)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.exception("Fatal error in main loop: %s", e)
-    finally:
-        try:
-            save_seen_atomic(SEEN_FILE, seen)
-        except Exception:
-            pass
-        logger.info("Volume Bot exited")
+
+    while True:
+        run_once(seen)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
