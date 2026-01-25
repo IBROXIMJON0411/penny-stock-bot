@@ -73,27 +73,25 @@ def load_seen(path: str) -> Dict[str, float]:
 
 def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
     """
-    Safely write `seen` dict to `path` atomically.
-
-    - Tries to create target directory if missing.
-    - Writes a temporary file inside the target directory for atomic os.replace.
-    - If target directory cannot be used, falls back to system temp dir and then attempts move.
+    Safely write seen dict to path atomically.
+    - Ensures target directory exists (tries to create it).
+    - If cannot create/use the target dir, falls back to system temp dir and then attempts to move.
     - Cleans up temporary file on failure.
     """
     abs_path = os.path.abspath(path)
     target_dir = os.path.dirname(abs_path) or "."
 
     tmpname = None
-    # Try to ensure directory exists
+    # Try ensure target directory exists
     try:
         os.makedirs(target_dir, exist_ok=True)
     except Exception as e:
-        logger.warning("Directory %s ni yaratib bo'lmadi: %s. Fallback ishlatiladi.", target_dir, e)
+        logger.warning("Directory '%s' yaratib bo'lmadi: %s. Fallback system temp ishlatiladi.", target_dir, e)
         target_dir = None
 
     try:
         if target_dir:
-            # Best effort: create temp file inside target dir for atomic replace
+            # Write temp file inside target dir (best for atomic replace)
             with tempfile.NamedTemporaryFile("w", delete=False, dir=target_dir, encoding="utf-8") as tf:
                 json.dump(seen, tf, ensure_ascii=False, indent=2)
                 tmpname = tf.name
@@ -103,15 +101,15 @@ def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
             with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
                 json.dump(seen, tf, ensure_ascii=False, indent=2)
                 tmpname = tf.name
-            # attempt to create the target dir now (best-effort) before replace
+            # Best-effort: try to create target dir now before move
             try:
                 os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
             except Exception:
-                logger.debug("Target dir still not creatable; os.replace may fail.")
+                logger.debug("Target dir yaratib bo'lmadi; os.replace may still fail.")
             os.replace(tmpname, abs_path)
     except Exception as e:
         logger.error("Seen save error: %s", e)
-        # cleanup tmp file if left behind
+        # Cleanup tmp file if exists
         try:
             if tmpname and os.path.exists(tmpname):
                 os.remove(tmpname)
