@@ -71,13 +71,13 @@ def load_seen(path: str) -> Dict[str, float]:
         logger.warning("Seen файлни юклашда хато: %s", e)
     return {}
 
-def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
-    """
-    Safely write seen dict to path atomically.
-    - Ensures target directory exists (tries to create it).
-    - If cannot create/use the target dir, falls back to system temp dir and then attempts to move.
-    - Cleans up temporary file on failure.
-    """
+def save_seen(path: str, seen: Dict[str, float]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(seen, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Seen save error: %s", e)
+    
     abs_path = os.path.abspath(path)
     target_dir = os.path.dirname(abs_path) or "."
 
