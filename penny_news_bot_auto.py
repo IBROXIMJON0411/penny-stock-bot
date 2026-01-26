@@ -17,7 +17,7 @@ import yfinance as yf
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
-SEEN_FILE = os.getenv("SEEN_FILE", "./seen.json")
+SEEN_FILE = os.getenv("SEEN_FILE", "./seen.json")  # recommended: ./seen.json or /tmp/seen.json
 TICKERS_ENV = os.getenv("TICKERS")
 TICKERS_FILE = os.getenv("TICKERS_FILE")
 REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "5"))
@@ -32,6 +32,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger("volume_bot")
+
+logger.info("Using SEEN_FILE=%s", SEEN_FILE)
 
 # ================= HTTP SESSION =================
 from requests.adapters import HTTPAdapter
@@ -67,7 +69,7 @@ def load_seen(path: str) -> Dict[str, float]:
                     except Exception:
                         out[str(k)] = time.time()
                 return out
-    Exception as e:
+    except Exception as e:
         logger.warning("Seen С„Р°Р№Р»РЅРё СЋРєР»Р°С€РґР° С…Р°С‚Рѕ: %s", e)
     return {}
 
@@ -82,49 +84,39 @@ def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
     abs_path = os.path.abspath(path)
     tmpname = None
     try:
-        # Create system-temp temporary file (no dir specified)
+        # 1) write temp file in system tempdir (no dir=)
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
             json.dump(seen, tf, ensure_ascii=False, indent=2)
             tmpname = tf.name
 
-        # Attempt atomic replace first
+        # 2) try atomic replace (best)
         try:
-            # Try to ensure target dir exists (best-effort) before replace
+            # ensure target dir exists if possible
             target_dir = os.path.dirname(abs_path) or "."
             try:
                 os.makedirs(target_dir, exist_ok=True)
             except Exception:
-                # If cannot create, still try replace (may fail)
-                logger.debug("Cannot ensure target dir exists (%s); will attempt os.replace anyway.", target_dir)
-
+                logger.debug("Could not create target dir %s (continuing to os.replace)", target_dir)
             os.replace(tmpname, abs_path)
-            tmpname = None  # moved successfully
+            tmpname = None
             return
         except Exception as e_replace:
             logger.debug("os.replace failed: %s", e_replace)
-            # Try direct write to target as fallback
+            # fallback: try direct write
             try:
-                # Ensure directory exists
-                try:
-                    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-                except Exception:
-                    logger.debug("Could not create target dir for direct write.")
                 with open(abs_path, "w", encoding="utf-8") as f:
                     json.dump(seen, f, ensure_ascii=False, indent=2)
-                # Clean up temp file if still present
-                try:
-                    if tmpname and os.path.exists(tmpname):
-                        os.remove(tmpname)
-                        tmpname = None
-                except Exception:
-                    pass
+                # cleanup temp file
+                if tmpname and os.path.exists(tmpname):
+                    os.remove(tmpname)
+                    tmpname = None
                 return
             except Exception as e_write:
-                logger.error("Direct write to %s failed: %s", abs_path, e_write)
+                logger.error("Direct write failed: %s", e_write)
     except Exception as e:
         logger.error("Seen save error: %s", e)
     finally:
-        # Cleanup any leftover tempfile
+        # cleanup
         try:
             if tmpname and os.path.exists(tmpname):
                 os.remove(tmpname)
@@ -151,14 +143,18 @@ def send_telegram(msg: str) -> None:
     except Exception as e:
         logger.error("Telegram С…Р°С‚Рѕ: %s", e)
 
-# ================= TICKERS =================
-def load_tickers() -> List[str]:
+# ================= TICKERS ================= List[str]:
     if TICKERS_ENV:
         return [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
     if TICKERS_FILE and os.path.exists(TICKERS_FILE):
         try:
             with open(TICKERS_FILE, "r", encoding="utf-8") as f:
-                return [l.strip() for l in f ifOLUME =================
+                return [l.strip() for l in f if l.strip()]
+        except Exception as e:
+            logger.warning("Tickers С„Р°Р№Р»РЅРё СћТ›РёС€РґР° С…Р°С‚Рѕ: %s", e)
+    return []
+
+# ================= PRICE & VOLUME =================
 def fetch_price_data(symbol: str) -> Optional[pd.DataFrame]:
     try:
         df = yf.download(symbol, period="10d", interval="1d", progress=False)
@@ -240,7 +236,7 @@ def fetch_polygon_news(symbol: str):
                 "url": n.get("article_url", "") or n.get("url", "")
             })
     except Exception as e:
-        logger.debug("Polygon fetch %s", symbol, e)
+        logger.debug("Polygon fetch error for %s: %s", symbol, e)
     return news
 
 # ================= MAIN LOOP =================
@@ -280,7 +276,8 @@ def run_once(seen: Dict[str, float]) -> None:
         time.sleep(0.3)
 
     for p in fetch_reddit_discussions():
-        key = p.get("url") or p.get(" or key in seen:
+        key = p.get("url") or p.get("title")
+        if not key or key in seen:
             continue
         send_telegram(
             f"рџ’¬ <b>Reddit РјСѓТіРѕРєР°РјР°СЃРё</b>\n"
