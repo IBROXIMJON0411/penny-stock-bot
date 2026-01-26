@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Volume + Price Spike Tracker with Social & News Alerts
+"""
+
 from __future__ import annotations
 
 import os
@@ -6,7 +13,7 @@ import json
 import html
 import logging
 import tempfile
-from typing import List, Dict, Optional
+from typing import Dict, Optional
 from urllib.parse import quote_plus
 
 import requests
@@ -16,13 +23,17 @@ import yfinance as yf
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
-SEEN_FILE = os.getenv("SEEN_FILE", "./seen.json")  # recommended: ./seen.json or /tmp/seen.json
-TICKERS_ENV = os.getenv("TICKERS")
-TICKERS_FILE = os.getenv("TICKERS_FILE")
+SEEN_FILE = os.getenv("SEEN_FILE", "/tmp/seen.json")
+
+TICKERS_ENV = os.getenv("TICKERS")              # "AAPL,MSFT,TSLA"
+TICKERS_FILE = os.getenv("TICKERS_FILE")        # optional file
+
 REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "5"))
-PRICE_RISE_THRESHOLD = float(os.getenv("PRICE_RISE_THRESHOLD", "5.0"))
-VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "5.0"))
+PRICE_RISE_THRESHOLD = float(os.getenv("PRICE_RISE_THRESHOLD", "3.0"))
+VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "50.0"))
+
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 USER_AGENT = os.getenv("USER_AGENT", "VolumeBot/1.0")
 
@@ -32,8 +43,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger("volume_bot")
-
-logger.info("Using SEEN_FILE=%s", SEEN_FILE)
 
 # ================= HTTP SESSION =================
 from requests.adapters import HTTPAdapter
@@ -52,202 +61,116 @@ SESSION = create_session()
 
 # ================= SEEN =================
 def load_seen(path: str) -> Dict[str, float]:
-    """
-    Load seen dict from JSON file. Returns empty dict on failure.
-    Ensures values are floats (timestamps) where possible.
-    """
     try:
         if not os.path.exists(path):
             return {}
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                out: Dict[str, float] = {}
-                for k, v in data.items():
-                    try:
-                        out[str(k)] = float(v)
-                    except Exception:
-                        out[str(k)] = time.time()
-                return out
+            return json.load(f)
     except Exception as e:
-        logger.warning("Seen С„Р°Р№Р»РЅРё СЋРєР»Р°С€РґР° С…Р°С‚Рѕ: %s", e)
-    return {}
+        logger.warning("Seen С„Р°Р№Р»РЅРё СћТ›РёС€РґР° С…Р°С‚Рѕ: %s", e)
+        return {}
 
 def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
-    """
-    Robust atomic save:
-    - Write temp file in system tempdir (avoids needing target dir writable).
-    - Then try os.replace to move temp into place.
-    - If os.replace fails, attempt to create target dir and write directly.
-    - Clean up temp file on errors.
-    """
-    abs_path = os.path.abspath(path)
-    tmpname = None
+    tmp = None
     try:
-        # 1) write temp file in system tempdir (no dir=)
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
             json.dump(seen, tf, ensure_ascii=False, indent=2)
-            tmpname = tf.name
-
-        # 2) try atomic replace (best)
-        try:
-            # ensure target dir exists if possible
-            target_dir = os.path.dirname(abs_path) or "."
-            try:
-                os.makedirs(target_dir, exist_ok=True)
-            except Exception:
-                logger.debug("Could not create target dir %s (continuing to os.replace)", target_dir)
-            os.replace(tmpname, abs_path)
-            tmpname = None
-            return
-        except Exception as e_replace:
-            logger.debug("os.replace failed: %s", e_replace)
-            # fallback: try direct write
-            try:
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    json.dump(seen, f, ensure_ascii=False, indent=2)
-                # cleanup temp file
-                if tmpname and os.path.exists(tmpname):
-                    os.remove(tmpname)
-                    tmpname = None
-                return
-            except Exception as e_write:
-                logger.error("Direct write failed: %s", e_write)
+            tmp = tf.name
+        os.replace(tmp, path)
     except Exception as e:
         logger.error("Seen save error: %s", e)
     finally:
-        # cleanup
         try:
-            if tmpname and os.path.exists(tmpname):
-                os.remove(tmpname)
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
         except Exception:
             pass
 
-def mark_seen(seen: Dict[str, float], key: str) -> None:
-    seen[str(key)] = time.time()
+def mark_seen(seen: Dict[str, float], key: str):
+    seen[key] = time.time()
 
 # ================= TELEGRAM =================
-def send_telegram(msg: str) -> None:
+def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("Telegram РєРѕРЅС„РёРіСѓСЂР°С†РёСЏСЃРё Р№СћТ›, С…Р°Р±Р°СЂ СЋР±РѕСЂРёР»РјР°РґРё")
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
         "parse_mode": "HTML"
     }
+
     try:
-        r = SESSION.post(url, json=payload, timeout=10)
-        r.raise_for_status()
+        SESSION.post(url, json=payload, timeout=10).raise_for_status()
     except Exception as e:
         logger.error("Telegram С…Р°С‚Рѕ: %s", e)
 
-# ================= TICKERS ================= List[str]:
+# ================= TICKERS =================
+def load_tickers():
     if TICKERS_ENV:
-        return [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
+        return [t.strip().upper() for t in TICKERS_ENV.split(",") if t.strip()]
+
     if TICKERS_FILE and os.path.exists(TICKERS_FILE):
         try:
             with open(TICKERS_FILE, "r", encoding="utf-8") as f:
-                return [l.strip() for l in f if l.strip()]
+                return [l.strip().upper() for l in f if l.strip()]
         except Exception as e:
-            logger.warning("Tickers С„Р°Р№Р»РЅРё СћТ›РёС€РґР° С…Р°С‚Рѕ: %s", e)
+            logger.warning("Tickers С„Р°Р№Р»РґР° С…Р°С‚Рѕ: %s", e)
+
     return []
 
 # ================= PRICE & VOLUME =================
 def fetch_price_data(symbol: str) -> Optional[pd.DataFrame]:
     try:
-        df = yf.download(symbol, period="10d", interval="1d", progress=False)
-        if df is None or df.empty:
+        df = yf.download(symbol, period="7d", interval="1d", progress=False)
+        if df is None or df.empty or len(df) < 2:
             return None
         return df
     except Exception as e:
-        logger.debug("Price fetch error for %s: %s", symbol, e)
+        logger.debug("Price fetch error %s: %s", symbol, e)
         return None
 
-def percent_change(a: float, b: float) -> Optional[float]:
-    try:
-        if b == 0:
-            return None
-        return (a - b) / b * 100
-    except Exception:
+def percent_change(new: float, old: float) -> Optional[float]:
+    if old == 0:
         return None
+    return (new - old) / old * 100
 
 def check_volume_price_spike(df: pd.DataFrame) -> Optional[str]:
-    if df is None or len(df) < 2:
-        return None
-
     today = df.iloc[-1]
     prev = df.iloc[-2]
 
-    try:
-        price_change = percent_change(float(today["Close"]), float(prev["Close"]))
-        volume_change = percent_change(float(today["Volume"]), float(prev["Volume"]))
-    except Exception:
+    price_change = percent_change(today["Close"], prev["Close"])
+    volume_change = percent_change(today["Volume"], prev["Volume"])
+
+    if price_change is None or volume_change is None:
         return None
 
-    if (
-        price_change is not None
-        and volume_change is not None
-        and price_change >= PRICE_RISE_THRESHOLD
-        and volume_change >= VOLUME_SPIKE_THRESHOLD
-    ):
-        return f"рџ“€ РќР°СЂС… {price_change:.1f}% РІР° Volume {volume_change:.1f}% РѕС€РґРё"
-
-    # handle division-by-zero (prev == 0)
-    if price_change is None and volume_change is None and float(today.get("Close", 0)) > 0 and float(today.get("Volume", 0)) > 0:
-        return "рџ“€ РќР°СЂС… РІР° VolumeРґР° СЏРЅРіРё С„Р°РѕР»РёСЏС‚ (РёР»Рє РјР°СЉР»СѓРјРѕС‚Р»Р°СЂ)"
+    if price_change >= PRICE_RISE_THRESHOLD and volume_change >= VOLUME_SPIKE_THRESHOLD:
+        return f"рџ“€ РќР°СЂС… +{price_change:.2f}% | Volume +{volume_change:.2f}%"
 
     return None
 
 # ================= REDDIT =================
-def fetch_reddit_discussions():
+def fetch_reddit():
     url = f"https://www.reddit.com/r/stocks/new/.json?limit={REDDIT_LIMIT}"
     posts = []
     try:
         r = SESSION.get(url, timeout=10)
         r.raise_for_status()
-        data = r.json().get("data", {}).get("children", [])
-        for p in data:
-            d = p.get("data", {})
-            posts.append({
-                "title": d.get("title", ""),
-                "url": f"https://reddit.com{d.get('permalink', '')}"
-            })
-    except Exception as e:
-        logger.debug("Reddit fetch error: %s", e)
+        for p in r.json()["data"]["children"]:
+            d = p["data"]
+            posts.append((d["title"], "https://reddit.com" + d["permalink"]))
+    except Exception:
+        pass
     return posts
 
-# ================= POLYGON NEWS =================
-def fetch_polygon_news(symbol: str):
-    if not POLYGON_API_KEY:
-        return []
-    url = (
-        "https://api.polygon.io/v2/reference/news?"
-        f"query={quote_plus(symbol)}&limit=3&apiKey={POLYGON_API_KEY}"
-    )
-    news = []
-    try:
-        r = SESSION.get(url, timeout=10)
-        r.raise_for_status()
-        for n in r.json().get("results", []):
-            news.append({
-                "title": n.get("title", ""),
-                "url": n.get("article_url", "") or n.get("url", "")
-            })
-    except Exception as e:
-        logger.debug("Polygon fetch error for %s: %s", symbol, e)
-    return news
-
-# ================= MAIN LOOP =================
-def run_once(seen: Dict[str, float]) -> None:
+# ================= MAIN =================
+def run_once(seen):
     tickers = load_tickers()
-
     if not tickers:
-        logger.info("РўРёРєРµСЂР»Р°СЂ Р±РµСЂРёР»РјР°РіР°РЅ")
+        logger.warning("РўРёРєРµСЂР»Р°СЂ Р№СћТ›")
         return
-
-    logger.info("РљСѓР·Р°С‚РёР»Р°С‘С‚РіР°РЅ С‚РёРєРµСЂР»Р°СЂ: %s", ", ".join(tickers))
 
     for symbol in tickers:
         df = fetch_price_data(symbol)
@@ -256,59 +179,33 @@ def run_once(seen: Dict[str, float]) -> None:
 
         spike = check_volume_price_spike(df)
         if spike:
-            send_telegram(
-                f"вљ пёЏ <b>{html.escape(symbol)}</b>\n{html.escape(spike)}"
-            )
-            mark_seen(seen, f"spike_{symbol}")
-            save_seen_atomic(SEEN_FILE, seen)
-
-            for n in fetch_polygon_news(symbol):
-                key = n.get("url") or n.get("title")
-                if not key or key in seen:
-                    continue
-                send_telegram(
-                    f"рџ“° <b>{html.escape(symbol)}</b>\n"
-                    f"{html.escape(n['title'])}\n{html.escape(n['url'])}"
-                )
+            key = f"{symbol}_{int(time.time() // 3600)}"
+            if key not in seen:
+                send_telegram(f"вљ пёЏ <b>{symbol}</b>\n{html.escape(spike)}")
                 mark_seen(seen, key)
                 save_seen_atomic(SEEN_FILE, seen)
 
-        time.sleep(0.3)
+        time.sleep(1)
 
-    for p in fetch_reddit_discussions():
-        key = p.get("url") or p.get("title")
-        if not key or key in seen:
-            continue
-        send_telegram(
-            f"рџ’¬ <b>Reddit РјСѓТіРѕРєР°РјР°СЃРё</b>\n"
-            f"{html.escape(p['title'])}\n{html.escape(p['url'])}"
-        )
-        mark_seen(seen, key)
-        save_seen_atomic(SEEN_FILE, seen)
-        time.sleep(0.2)
+    for title, url in fetch_reddit():
+        if url not in seen:
+            send_telegram(f"рџ’¬ <b>Reddit</b>\n{html.escape(title)}\n{url}")
+            mark_seen(seen, url)
+            save_seen_atomic(SEEN_FILE, seen)
 
-# ================= ENTRY =================
 def main():
     logger.info("Р‘РѕС‚ РёС€РіР° С‚СѓС€РґРё")
     send_telegram(
         "вњ… <b>Р‘РѕС‚ РёС€РіР° С‚СѓС€РґРё</b>\n"
-        "рџ“Љ Volume РІР° РЅР°СЂС… РєСѓР·Р°С‚РёР»СЏРїС‚Рё\n"
-        "рџ“° РЇРЅРіРёР»РёРєР»Р°СЂ РІР° Reddit РјСѓТіРѕРєР°РјР°Р»Р°СЂРё С‚РµРєС€РёСЂРёР»Р°РґРё"
+        "рџ“Љ РќР°СЂС… РІР° Volume РєСѓР·Р°С‚РёР»СЏРїС‚Рё\n"
+        "рџ“° Reddit СЏРЅРіРёР»РёРєР»Р°СЂ С‚РµРєС€РёСЂРёР»Р°РґРё"
     )
 
     seen = load_seen(SEEN_FILE)
 
-    try:
-        while True:
-            run_once(seen)
-            time.sleep(POLL_INTERVAL)
-    except KeyboardInterrupt:
-        logger.info("Р‘РѕС‚ С‚СћС…С‚Р°С‚РёР»РґРё (KeyboardInterrupt)")
-    finally:
-        try:
-            save_seen_atomic(SEEN_FILE, seen)
-        except Exception:
-            pass
+    while True:
+        run_once(seen)
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
