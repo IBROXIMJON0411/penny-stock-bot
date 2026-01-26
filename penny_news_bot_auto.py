@@ -71,53 +71,57 @@ def load_seen(path: str) -> Dict[str, float]:
         logger.warning("Seen файлни юклашда хато: %s", e)
     return {}
 
-def save_seen(path: str, seen: Dict[str, float]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(seen, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.exception("Seen save error: %s", e)
-    
+def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
+    """
+    Safely write seen dict to path atomically where possible.
+    - Tries to create target directory.
+    - Writes temp file (in system tempdir) then tries os.replace to target.
+    - If replace fails, falls back to direct write to target (best-effort).
+    - Cleans up temporary file on failure.
+    """
     abs_path = os.path.abspath(path)
     target_dir = os.path.dirname(abs_path) or "."
 
     tmpname = None
-    # Try ensure target directory exists
+    # Try to ensure target directory exists
     try:
         os.makedirs(target_dir, exist_ok=True)
     except Exception as e:
         logger.warning("Directory '%s' yaratib bo'lmadi: %s. Fallback system temp ishlatiladi.", target_dir, e)
-        target_dir = None
+        # keep going; we'll still try to write to temp and then move
 
     try:
-        if target_dir:
-            # Write temp file inside target dir (best for atomic replace)
-            with tempfile.NamedTemporaryFile("w", delete=False, dir=target_dir, encoding="utf-8") as tf:
-                json.dump(seen, tf, ensure_ascii=False, indent=2)
-                tmpname = tf.name
+        # Create temp file in system tempdir (avoids failures when target dir not creatable)
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+            json.dump(seen, tf, ensure_ascii=False, indent=2)
+            tmpname = tf.name
+
+        # Try atomic replace (best option)
+        try:
             os.replace(tmpname, abs_path)
-        else:
-            # Fallback: write in system temp then try to move
-            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
-                json.dump(seen, tf, ensure_ascii=False, indent=2)
-                tmpname = tf.name
-            # Best-effort: try to create target dir now before move
+            return
+        except Exception as e_replace:
+            logger.debug("os.replace failed (%s). Trying direct write to target.", e_replace)
+            # Attempt direct write to target as fallback
             try:
-                os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-            except Exception:
-                logger.debug("Target dir yaratib bo'lmadi; os.replace may still fail.")
-            os.replace(tmpname, abs_path)
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    json.dump(seen, f, ensure_ascii=False, indent=2)
+                # cleanup temp
+                if tmpname and os.path.exists(tmpname):
+                    os.remove(tmpname)
+                return
+            except Exception as e_write:
+                logger.error("Direct write to %s failed: %s", abs_path, e_write)
+                # keep going to cleanup below
     except Exception as e:
         logger.error("Seen save error: %s", e)
-        # Cleanup tmp file if exists
+    finally:
+        # Cleanup temp file if it still exists
         try:
             if tmpname and os.path.exists(tmpname):
                 os.remove(tmpname)
         except Exception:
             pass
-
-def mark_seen(seen: Dict[str, float], key: str) -> None:
-    seen[str(key)] = time.time()
 
 # ================= TELEGRAM =================
 def send_telegram(msg: str) -> None:
