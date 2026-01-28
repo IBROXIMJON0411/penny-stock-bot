@@ -1,3 +1,4 @@
+Иброхимжон, [29.01.2026 0:36]
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -35,10 +36,10 @@ logger = logging.getLogger("volume_bot")
 # ================ TELEGRAM ================
 def send_telegram(msg: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram конфигурацияси йўқ; хabar юборилмади.")
+        logger.warning("Telegram конфигурацияси йўқ; хабар юборилмади.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-   text": msg, "parse_mode": "HTML", "disable_web_page_preview": False}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
@@ -93,8 +94,10 @@ async def polygon_ws_loop():
 
                 while True:
                     try:
-                        raw = await ws.recv()
-            except websockets.ConnectionClosed as e:
+
+Иброхимжон, [29.01.2026 0:36]
+raw = await ws.recv()
+                    except websockets.ConnectionClosed as e:
                         logger.warning("WebSocket closed: %s", e)
                         break
                     except Exception as e:
@@ -175,7 +178,9 @@ async def polygon_ws_loop():
             logger.info("Reconnect backoff %s seconds...", backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 300)  # exponential backoff up to 5 min
-            def main():
+
+Иброхимжон, [29.01.2026 0:36]
+def main():
     logger.info("Polygon Volume Spike Bot starting")
     try:
         asyncio.run(polygon_ws_loop())
