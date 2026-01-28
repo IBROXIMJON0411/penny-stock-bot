@@ -1,254 +1,193 @@
-from __future__ import annotations
+Иброхимжон, [29.01.2026 0:36]
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
-import time
 import json
-import html
+import time
 import logging
-import tempfile
-from typing import List, Dict, Optional, Any
-
+import html
+import asyncio
+from collections import defaultdict
+from statistics import mean
+from typing import Dict, List, Set
+from urllib.parse import quote_plus
 
 import requests
-import pandas as pd
+import websockets
 
-# ================= OPTIONAL LIBS =================
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except Exception:
-    YFINANCE_AVAILABLE = False
-
-try:
-    from deep_translator import GoogleTranslator
-except Exception:
-    GoogleTranslator = None
-
-# ================= CONFIG =================
+# ================ CONFIG ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
-SEEN_FILE = os.getenv("SEEN_FILE", "seen.json")
+VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", "5"))   # spike threshold
+PRICE_MIN = float(os.getenv("PRICE_MIN", "0.2"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "10"))
+AVERAGE_WINDOW = int(os.getenv("AVERAGE_WINDOW", "5"))          # how many recent trades to average
+DEDUPE_SECONDS = int(os.getenv("DEDUPE_SECONDS", "300"))        # suppress same-ticker spikes for this many seconds
+NEWS_LIMIT = int(os.getenv("NEWS_LIMIT", "3"))                  # how many news items to fetch
+SOCKET_URL = os.getenv("POLYGON_SOCKET_URL", "wss://socket.polygon.io/stocks")
 
-TICKERS_ENV = os.getenv("TICKERS")
-TICKERS_FILE = os.getenv("TICKERS_FILE")
+# ================ LOGGING ================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("volume_bot")
 
-REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "5"))
-
-RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "70"))
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
-
-SEND_ALL_INDICATORS = os.getenv("SEND_ALL_INDICATORS", "false").lower() == "true"
-
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    "Mozilla/5.0 (compatible; DynamicBot/1.0)"
-)
-
-# ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger("dynamic_bot")
-
-# ================= TRANSLATOR =================
-translator = None
-if GoogleTranslator:
-    try:
-        translator = GoogleTranslator(source="en", target="uz")
-    except Exception:
-        translator = None
-
-def uzbek(text: str) -> str:
-    if not translator or not text:
-        return text
-    try:
-        return translator.translate(text)
-    except Exception:
-        return text
-
-# ================= HTTP SESSION =================
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-def create_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504)
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers.update({"User-Agent": USER_AGENT})
-    return s
-
-SESSION = create_session()
-
-# ================= SEEN =================
-def load_seen(path: str) -> Dict[str, float]:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_seen_atomic(path: str, seen: Dict[str, float]) -> None:
-    try:
-        d = os.path.dirname(path) or "."
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=d, encoding="utf-8") as tf:
-            json.dump(seen, tf, ensure_ascii=False, indent=2)
-            tmp = tf.name
-        os.replace(tmp, path)
-    except Exception as e:
-        logger.exception("Seen save error: %s", e)
-
-# ================= TELEGRAM =================
-def send_telegram(text: str) -> None:
+# ================ TELEGRAM ================
+def send_telegram(msg: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        logger.warning("Telegram конфигурацияси йўқ; хабар юборилмади.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": False}
     try:
-        SESSION.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=10
-        )
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        return True
     except Exception as e:
-        logger.error("Telegram error: %s", e)
+        logger.error("Telegram юбориш хатоси: %s", e)
+        return False
 
-# ================= TICKERS =================
-def load_tickers() -> List[str]:
-    if TICKERS_ENV:
-        return [t.strip() for t in TICKERS_ENV.split(",") if t.strip()]
-    if TICKERS_FILE and os.path.exists(TICKERS_FILE):
-        with open(TICKERS_FILE) as f:
-            return [l.strip() for l in f if l.strip()]
-    return []
-
-# ================= INDICATORS =================
-def fetch_price(symbol: str) -> Optional[pd.DataFrame]:
-    if not YFINANCE_AVAILABLE:
-        return None
+# ================ NEWS (Polygon) ================
+def fetch_news(ticker: str, limit: int = NEWS_LIMIT) -> List[Dict[str, str]]:
+    if not POLYGON_API_KEY:
+        return []
+    q = quote_plus(ticker)
+    url = f"https://api.polygon.io/v2/reference/news"
+    params = {"query": q, "limit": limit, "apiKey": POLYGON_API_KEY}
     try:
-        df = yf.download(symbol, period="90d", interval="1d", progress=False)
-        if df.empty:
-            return None
-        return df.sort_index()
-    except Exception:
-        return None
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("results", []) or []
+        news_list = []
+        for it in items:
+            title = it.get("title") or it.get("headline") or ""
+            article_url = it.get("article_url") or it.get("url") or ""
+            news_list.append({"title": title, "url": article_url})
+        return news_list
+    except Exception as e:
+        logger.debug("Polygon news fetch error for %s: %s", ticker, e)
+        return []
 
-def calculate_indicators(df: pd.DataFrame) -> Dict[str, float]:
-    close = df["Close"].dropna()
-    out: Dict[str, float] = {}
+# ================ WEBSOCKET LOGIC ================
+trade_history: Dict[str, List[float]] = defaultdict(list)  # ticker -> recent volumes
+last_spike_time: Dict[str, float] = {}                     # ticker -> last spike epoch
+seen_news_urls: Set[str] = set()
 
-    if len(close) < 2:
-        return out
-
-    out["LAST"] = float(close.iloc[-1])
-
-    out["EMA_10"] = float(close.ewm(span=10).mean().iloc[-1])
-    out["EMA_50"] = float(close.ewm(span=50).mean().iloc[-1])
-
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9).mean()
-
-    out["MACD"] = float(macd.iloc[-1])
-    out["MACD_SIGNAL"] = float(signal.iloc[-1])
-
-    delta = close.diff().dropna()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean().iloc[-1]
-    avg_loss = loss.rolling(14).mean().iloc[-1]
-
-    out["RSI"] = 100.0 if avg_loss == 0 else float(
-        100 - (100 / (1 + avg_gain / avg_loss))
-    )
-
-    return out
-
-# ================= SIGNALS =================
-def detect_signals(ind: Dict[str, float]) -> List[str]:
-    sig = []
-
-    if ind["EMA_10"] > ind["EMA_50"]:
-        sig.append("EMA bullish")
-
-    if ind["MACD"] > ind["MACD_SIGNAL"]:
-        sig.append("MACD bullish")
-
-    if ind["RSI"] >= RSI_OVERBOUGHT:
-        sig.append("RSI overbought")
-    elif ind["RSI"] <= RSI_OVERSOLD:
-        sig.append("RSI oversold")
-
-    return sig
-
-# ================= SOCIAL =================
-def fetch_reddit() -> List[Dict[str, str]]:
-    posts = []
-    url = f"https://www.reddit.com/r/CryptoCurrency/new/.json?limit={REDDIT_LIMIT}"
-    try:
-        r = SESSION.get(url, timeout=10)
-        j = r.json()
-        for p in j.get("data", {}).get("children", []):
-            d = p["data"]
-            posts.append({
-                "title": d.get("title", ""),
-                "url": f"https://reddit.com{d.get('permalink')}"
-            })
-    except Exception:
-        pass
-    return posts
-
-# ================= MAIN =================
-def run_once(seen: Dict[str, float]) -> None:
-    for symbol in load_tickers():
-        df = fetch_price(symbol)
-        if not df:
-            continue
-
-        ind = calculate_indicators(df)
-        sig = detect_signals(ind)
-
-        if sig:
-            msg = (
-                f"⚠️ <b>{symbol}</b>\n"
-                + "\n".join(f"• {s}" for s in sig)
-                + f"\nRSI: {ind['RSI']:.2f}"
-            )
-            send_telegram(msg)
-
-        time.sleep(0.5)
-
-    for p in fetch_reddit():
-        if p["url"] in seen:
-            continue
-        send_telegram(f"💬 {uzbek(p['title'])}\n{p['url']}")
-        seen[p["url"]] = time.time()
-        save_seen_atomic(SEEN_FILE, seen)
-
-def main():
-    logger.info("Bot started")
-    send_telegram("🚀 Bot ишга тушди ва ишлаяпти")
-    seen = load_seen(SEEN_FILE)
-
+async def polygon_ws_loop():
+    backoff = 1
     while True:
-        run_once(seen)
-        time.sleep(POLL_INTERVAL)
+        try:
+            logger.info("Connecting to Polygon WebSocket: %s", SOCKET_URL)
+            async with websockets.connect(SOCKET_URL, ping_interval=20, ping_timeout=10) as ws:
+                # auth
+                auth_msg = {"action": "auth", "params": POLYGON_API_KEY}
+                await ws.send(json.dumps(auth_msg))
+                # subscribe to all trades (T.*). Adjust subscription to specific tickers if desired.
+                sub_msg = {"action": "subscribe", "params": "T.*"}
+                await ws.send(json.dumps(sub_msg))
+                logger.info("Authenticated and subscribed to trades.")
 
-if __name__ == "__main__":
+                # Reset backoff on successful connection
+                backoff = 1
+
+                while True:
+                    try:
+
+Иброхимжон, [29.01.2026 0:36]
+raw = await ws.recv()
+                    except websockets.ConnectionClosed as e:
+                        logger.warning("WebSocket closed: %s", e)
+                        break
+                    except Exception as e:
+                        logger.error("WebSocket recv error: %s", e)
+                        await asyncio.sleep(1)
+                        continue
+
+                    # Polygon may send newline-separated JSON or JSON array
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        # Not JSON -> skip
+                        continue
+
+                    # normalize to list
+                    events = msg if isinstance(msg, list) else [msg]
+                    for ev in events:
+                        # handle status/auth responses quietly
+                        if ev.get("ev") is None:
+                            # possible ack like {"status":"connected"} or auth response -> ignore
+                            continue
+                        if ev.get("ev") != "T":
+                            continue  # only trades
+
+                        ticker = ev.get("sym")
+                        price = ev.get("p", 0)
+                        volume = ev.get("s", 0)
+
+                        if not ticker:
+                            continue
+                        try:
+                            price = float(price)
+                            volume = float(volume)
+                        except Exception:
+                            continue
+
+                        # price filter
+                        if price < PRICE_MIN or price > PRICE_MAX:
+                            continue
+
+                        # update rolling history
+                        vols = trade_history[ticker]
+                        vols.append(volume)
+                        if len(vols) > AVERAGE_WINDOW:
+                            vols.pop(0)
+                        avg_vol = mean(vols) if vols else 0.0
+
+                        # detect spike
+                        if avg_vol > 0 and volume >= avg_vol * VOLUME_MULTIPLIER:
+                            now = time.time()
+                            last = last_spike_time.get(ticker, 0)
+                            if now - last >= DEDUPE_SECONDS:
+                                last_spike_time[ticker] = now
+                                # Spike detected -> notify
+                                msg_text = (
+                                    f"⚡ <b>{html.escape(ticker)}</b> — Volume spike detected!\n"
+                                    f"Price: <code>{price:.6f}$</code>\n"
+                                    f"Volume: <code>{int(volume)}</code>\n"
+                                    f"Avg ({len(vols)}): <code>{avg_vol:.1f}</code>"
+                                )
+                                logger.info("Spike: %s", msg_text)
+                                send_telegram(msg_text)
+
+                                # fetch and send news (if any)
+                                news_items = fetch_news(ticker)
+                                for n in news_items:
+                                    nurl = n.get("url") or ""
+                                    if not nurl:
+                                        continue
+                                    if nurl in seen_news_urls:
+                                        continue
+                                    seen_news_urls.add(nurl)
+                                    title = n.get("title") or ""
+                                    news_msg = f"📰 <b>{html.escape(ticker)}</b>\n{html.escape(title)}\n{html.escape(nurl)}"
+                                    send_telegram(news_msg)
+        except Exception as e:
+            logger.exception("WebSocket connection error: %s", e)
+            logger.info("Reconnect backoff %s seconds...", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)  # exponential backoff up to 5 min
+
+Иброхимжон, [29.01.2026 0:36]
+def main():
+    logger.info("Polygon Volume Spike Bot starting")
+    try:
+        asyncio.run(polygon_ws_loop())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, exiting.")
+    except Exception:
+        logger.exception("Fatal error in main")
+
+if name == "main":
     main()
