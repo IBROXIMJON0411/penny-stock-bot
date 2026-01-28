@@ -16,7 +16,6 @@ deep-translator
 requests
 pandas
 numpy
-ta
 yfinance
 beautifulsoup4
 lxml
