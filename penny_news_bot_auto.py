@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 еimport os
-import time
-import requests
-import logging
-import html
+уimport time
+уimport requests
+уimport logging
+уimport html
 
 # ================== CONFIG ==================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
