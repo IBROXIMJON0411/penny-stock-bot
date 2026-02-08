@@ -1,119 +1,98 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import time
 import requests
-import logging
-import html
+import time
+import os
 from datetime import datetime, timedelta
+import pytz
 
-# ============ CONFIG ============
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLYGON_KEY = os.getenv("POLYGON_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("TG_CHAT_ID")
 
-PRICE_MIN = 0.2
+BASE_URL = "https://api.polygon.io"
+
+seen = {}  # ticker -> {last_time, last_volume_x}
+
+ET = pytz.timezone("US/Eastern")
+
+PRICE_MIN = 0.20
 PRICE_MAX = 10.0
-VOLUME_MULTIPLIER = 2.0
-PRICE_CHANGE_MIN = 1.5   # %
-COOLDOWN_SECONDS = 600   # 10 минут
-POLL_INTERVAL = 60       # 1 минут
+COOLDOWN_MIN = 30
 
-# ============ LOGGING ============
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-logger = logging.getLogger("volume_test_bot")
-
-last_alert = {}
-
-# ============ TELEGRAM ============
-def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.error("Telegram error: %s", e)
+    requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
-# ============ POLYGON ============
-def get_active_tickers():
-    url = "https://api.polygon.io/v3/reference/tickers"
-    params = {
-        "market": "stocks",
-        "active": "true",
-        "limit": 200,
-        "apiKey": POLYGON_API_KEY
-    }
-    r = requests.get(url, params=params, timeout=15)
-    data = r.json()
-    return [t["ticker"] for t in data.get("results", [])]
+def market_open():
+    now = datetime.now(ET)
+    return now.weekday() < 5 and now.hour >= 4 and now.hour <= 20
 
-def get_last_minutes(ticker: str):
-    end = datetime.utcnow()
-    start = end - timedelta(minutes=10)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/minute/{start.date()}/{end.date()}"
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 10,
-        "apiKey": POLYGON_API_KEY
-    }
-    r = requests.get(url, params=params, timeout=10)
+def get_grouped(minutes):
+    date = datetime.now(ET).strftime("%Y-%m-%d")
+    url = f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{minutes}/{date}"
+    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code != 200:
+        return []
     return r.json().get("results", [])
 
-# ============ MAIN LOGIC ============
-def check_ticker(ticker: str):
-    candles = get_last_minutes(ticker)
-    if len(candles) < 6:
-        return
+def ema(values, period):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
 
-    last = candles[-1]
-    prev5 = candles[-6:-1]
+def process(timeframe, volume_x_need):
+    bars = get_grouped(timeframe)
+    now = datetime.now(ET)
 
-    price = last["c"]
-    if price < PRICE_MIN or price > PRICE_MAX:
-        return
+    for b in bars:
+        ticker = b["T"]
+        close = b["c"]
+        volume = b["v"]
+        open_price = b["o"]
 
-    avg_vol = sum(c["v"] for c in prev5) / 5
-    if avg_vol <= 0:
-        return
+        if not (PRICE_MIN <= close <= PRICE_MAX):
+            continue
 
-    price_change = ((last["c"] - prev5[-1]["c"]) / prev5[-1]["c"]) * 100
-    if last["v"] >= avg_vol * VOLUME_MULTIPLIER and price_change >= PRICE_CHANGE_MIN:
-        now = time.time()
-        if now - last_alert.get(ticker, 0) < COOLDOWN_SECONDS:
-            return
+        if close <= open_price:
+            continue
 
-        last_alert[ticker] = now
+        avg_volume = volume / volume_x_need
+        volume_x = volume / max(avg_volume, 1)
+
+        if volume_x < volume_x_need:
+            continue
+
+        prev = seen.get(ticker)
+        if prev:
+            if now - prev["time"] < timedelta(minutes=COOLDOWN_MIN):
+                if volume_x <= prev["vol"]:
+                    continue
+
         msg = (
-            f"🚀 <b>{html.escape(ticker)}</b>\n"
-            f"💲 Price: {price:.2f}$\n"
-            f"📊 Volume spike x{last['v']/avg_vol:.1f}\n"
-            f"📈 +{price_change:.2f}% (5 min)"
+            f"🚀 {ticker}\n"
+            f"💲 Price: {close:.2f}$\n"
+            f"📊 Volume spike x{volume_x:.1f}\n"
+            f"⏱ TF: {timeframe} min"
         )
-        logger.info("ALERT %s", ticker)
+
         send_telegram(msg)
+        seen[ticker] = {"time": now, "vol": volume_x}
 
 def main():
-    logger.info("Volume test bot started")
-    send_telegram("✅ Volume test bot ишга тушди")
-
-    tickers = get_active_tickers()
-    logger.info("Tickers loaded: %s", len(tickers))
-
+    send_telegram("✅ Volume test bot started")
     while True:
-        for t in tickers:
-            try:
-                check_ticker(t)
-            except Exception as e:
-                logger.debug("Error %s: %s", t, e)
-        time.sleep(POLL_INTERVAL)
+        try:
+            if market_open():
+                process(1, 5)   # FAST
+                process(5, 3)   # SLOW
+            time.sleep(60)
+        except Exception as e:
+            send_telegram(f"❌ Error: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
