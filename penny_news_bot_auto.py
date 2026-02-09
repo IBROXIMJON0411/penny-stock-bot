@@ -1,97 +1,91 @@
 import requests
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
-POLYGON_KEY = os.getenv("POLYGON_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+POLYGON = os.getenv("POLYGON_API_KEY")
+TG_TOKEN = os.getenv("TG_TOKEN")
 CHAT_ID = os.getenv("TG_CHAT_ID")
 
-BASE_URL = "https://api.polygon.io"
-
-seen = {}  # ticker -> {last_time, last_volume_x}
-
+BASE = "https://api.polygon.io"
 ET = pytz.timezone("US/Eastern")
 
 PRICE_MIN = 0.20
 PRICE_MAX = 10.0
-COOLDOWN_MIN = 30
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def tg(msg):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 def market_open():
     now = datetime.now(ET)
-    return now.weekday() < 5 and now.hour >= 4 and now.hour <= 20
+    return now.weekday() < 5 and 4 <= now.hour <= 20
 
-def get_grouped(minutes):
-    date = datetime.now(ET).strftime("%Y-%m-%d")
-    url = f"{BASE_URL}/v2/aggs/grouped/locale/us/market/stocks/{minutes}/{date}"
-    params = {"adjusted": "true", "apiKey": POLYGON_KEY}
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        return []
+def get_tickers():
+    url = f"{BASE}/v3/reference/tickers"
+    params = {
+        "market": "stocks",
+        "active": "true",
+        "limit": 200,
+        "apiKey": POLYGON
+    }
+    r = requests.get(url, params=params, timeout=20)
+    return [t["ticker"] for t in r.json().get("results", [])]
+
+def get_last_agg(ticker):
+    url = f"{BASE}/v2/aggs/ticker/{ticker}/range/1/minute/now-10/minute/now"
+    params = {"adjusted": "true", "apiKey": POLYGON}
+    r = requests.get(url, params=params, timeout=20)
     return r.json().get("results", [])
 
-def ema(values, period):
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-def process(timeframe, volume_x_need):
-    bars = get_grouped(timeframe)
-    now = datetime.now(ET)
-
-    for b in bars:
-        ticker = b["T"]
-        close = b["c"]
-        volume = b["v"]
-        open_price = b["o"]
-
-        if not (PRICE_MIN <= close <= PRICE_MAX):
-            continue
-
-        if close <= open_price:
-            continue
-
-        avg_volume = volume / volume_x_need
-        volume_x = volume / max(avg_volume, 1)
-
-        if volume_x < volume_x_need:
-            continue
-
-        prev = seen.get(ticker)
-        if prev:
-            if now - prev["time"] < timedelta(minutes=COOLDOWN_MIN):
-                if volume_x <= prev["vol"]:
-                    continue
-
-        msg = (
-            f"🚀 {ticker}\n"
-            f"💲 Price: {close:.2f}$\n"
-            f"📊 Volume spike x{volume_x:.1f}\n"
-            f"⏱ TF: {timeframe} min"
-        )
-
-        send_telegram(msg)
-        seen[ticker] = {"time": now, "vol": volume_x}
-
 def main():
-    send_telegram("✅ Volume test bot started")
+    tg("✅ Penny volume TEST v2 started")
+
+    tickers = get_tickers()
+    tg(f"📌 Tickers loaded: {len(tickers)}")
+
     while True:
         try:
-            if market_open():
-                process(1, 5)   # FAST
-                process(5, 3)   # SLOW
+            if not market_open():
+                time.sleep(60)
+                continue
+
+            for t in tickers[:100]:  # синов учун 100 та
+                aggs = get_last_agg(t)
+                if len(aggs) < 6:
+                    continue
+
+                last = aggs[-1]
+                prev = aggs[-6:-1]
+
+                price = last["c"]
+                if not (PRICE_MIN <= price <= PRICE_MAX):
+                    continue
+
+                avg_vol = sum(x["v"] for x in prev) / 5
+                if avg_vol == 0:
+                    continue
+
+                spike = last["v"] / avg_vol
+                if spike < 4:
+                    continue
+
+                change = (last["c"] - last["o"]) / last["o"] * 100
+                if change <= 0:
+                    continue
+
+                tg(
+                    f"🚀 {t}\n"
+                    f"💲 {price:.2f}$\n"
+                    f"📊 Volume x{spike:.1f}\n"
+                    f"📈 +{change:.2f}% (1m)"
+                )
+
             time.sleep(60)
+
         except Exception as e:
-            send_telegram(f"❌ Error: {e}")
+            tg(f"❌ ERROR: {e}")
             time.sleep(60)
 
 if __name__ == "__main__":
