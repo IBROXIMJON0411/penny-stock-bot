@@ -3,9 +3,9 @@ import requests, time, os
 from datetime import datetime, timedelta
 import pytz
 
-POLYGON = os.getenv("POLYGON_API_KEY")
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("TG_CHAT_ID")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BASE = "https://api.polygon.io"
 ET = pytz.timezone("US/Eastern")
