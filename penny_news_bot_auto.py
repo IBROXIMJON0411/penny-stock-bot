@@ -1,4 +1,3 @@
-Иброхимжон, [10.02.2026 20:37]
 import requests, time, os
 from datetime import datetime, timedelta
 import pytz
