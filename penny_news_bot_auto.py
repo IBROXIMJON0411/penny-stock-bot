@@ -1,64 +1,129 @@
+import asyncio
+import websockets
+import json
 import requests
-import time
-import os
-from datetime import datetime, timedelta
+from collections import defaultdict
+from datetime import datetime
 
-API_KEY = os.getenv("POLYGON_API_KEY")
-BASE_URL = "https://api.polygon.io"
-session = requests.Session()
+# ================= CONFIG =================
 
-TICKERS = ["AAPL", "TSLA", "NVDA", "MSFT"]
+POLYGON_API_KEY = "YOUR_POLYGON_KEY"
+TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
-def get_last_minute_candle(ticker):
-    now = datetime.utcnow()
-    end = now.replace(second=0, microsecond=0)
-    start = end - timedelta(minutes=1)
+PRICE_MIN = 0.20
+PRICE_MAX = 10.00
 
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = end.strftime("%Y-%m-%d")
+VOLUME_SPIKE_MULTIPLIER = 3      # Average'dan 3x катта бўлса сигнал
+RE_ALERT_MULTIPLIER = 1.5        # Аввалги сигналдан 1.5x катта бўлса қайта юбор
 
-    url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/minute/{start_str}/{end_str}"
+# ==========================================
 
-    for attempt in range(3):
-        try:
-            r = session.get(
-                url,
-                params={"apiKey": API_KEY},
-                timeout=20
-            )
+volume_data = defaultdict(lambda: {
+    "current_volume": 0,
+    "last_minute": None,
+    "avg_volume": 0,
+    "last_alert_volume": 0
+})
 
-            if r.status_code == 200:
-                data = r.json()
-                return data.get("results", [])
+# ================= TELEGRAM =================
 
-            elif r.status_code == 403:
-                print(f"403 retry {ticker}")
-                time.sleep(2)
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    requests.post(url, data=payload)
 
+# ================= SIGNAL LOGIC =================
+
+def process_trade(symbol, price, size):
+
+    if not (PRICE_MIN <= price <= PRICE_MAX):
+        return
+
+    now_minute = datetime.utcnow().replace(second=0, microsecond=0)
+    data = volume_data[symbol]
+
+    # Янги минут бошланса reset
+    if data["last_minute"] != now_minute:
+        if data["current_volume"] > 0:
+            if data["avg_volume"] == 0:
+                data["avg_volume"] = data["current_volume"]
             else:
-                print(f"{ticker} error {r.status_code}")
-                return None
+                data["avg_volume"] = (data["avg_volume"] + data["current_volume"]) / 2
 
-        except Exception as e:
-            print("Request failed:", e)
-            time.sleep(2)
+        data["current_volume"] = 0
+        data["last_minute"] = now_minute
 
-    return None
+    data["current_volume"] += size
 
+    # Average текшириш
+    if data["avg_volume"] == 0:
+        return
 
-# ===== MAIN LOOP =====
+    spike_ratio = data["current_volume"] / data["avg_volume"]
 
-while True:
-    print("=== New Cycle ===")
+    # Фақат ўсувчан томон
+    if spike_ratio >= VOLUME_SPIKE_MULTIPLIER:
 
-    for ticker in TICKERS:
-        data = get_last_minute_candle(ticker)
+        # Биринчи сигнал
+        if data["last_alert_volume"] == 0:
+            send_signal(symbol, price, data["current_volume"], spike_ratio)
+            data["last_alert_volume"] = data["current_volume"]
 
-        if data:
-            print(ticker, "OK", len(data))
-        else:
-            print(ticker, "No data")
+        # Қайта сигнал (яна кучли ошса)
+        elif data["current_volume"] >= data["last_alert_volume"] * RE_ALERT_MULTIPLIER:
+            send_signal(symbol, price, data["current_volume"], spike_ratio)
+            data["last_alert_volume"] = data["current_volume"]
 
-        time.sleep(1)   # Rate control
+def send_signal(symbol, price, volume, ratio):
 
-    time.sleep(60)
+    message = (
+        f"🚀 VOLUME SPIKE ALERT\n\n"
+        f"Symbol: {symbol}\n"
+        f"Price: ${price:.2f}\n"
+        f"Volume: {int(volume)}\n"
+        f"Spike: {ratio:.2f}x\n"
+        f"Time: {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+    )
+
+    print(message)
+    send_telegram(message)
+
+# ================= POLYGON WS =================
+
+async def main():
+
+    uri = "wss://socket.polygon.io/stocks"
+
+    async with websockets.connect(uri) as websocket:
+
+        # Auth
+        await websocket.send(json.dumps({
+            "action": "auth",
+            "params": POLYGON_API_KEY
+        }))
+
+        # Subscribe all trades
+        await websocket.send(json.dumps({
+            "action": "subscribe",
+            "params": "T.*"
+        }))
+
+        print("✅ Connected to Polygon")
+
+        while True:
+            msg = await websocket.recv()
+            data = json.loads(msg)
+
+            for trade in data:
+                if trade["ev"] == "T":
+                    symbol = trade["sym"]
+                    price = trade["p"]
+                    size = trade["s"]
+
+                    process_trade(symbol, price, size)
+
+asyncio.run(main())
