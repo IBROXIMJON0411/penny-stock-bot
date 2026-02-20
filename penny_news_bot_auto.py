@@ -3,27 +3,24 @@ import json
 import time
 import requests
 import websocket
-from dotenv import load_dotenv
-from collections import defaultdictс, deque
+from collections import defaultdict, deque
 from datetime import datetime
 
-# ENV yuklash
-load_dotenv()
-
-# ENV o'zgaruvchilar
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not POLYGON_API_KEY:
-    raise ValueError("POLYGON_API_KEY topilmadi .env da!")
+    print("POLYGON_API_KEY missing!")
+    exit()
 
 if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN topilmadi .env da!")
+    print("TELEGRAM_TOKEN missing!")
+    exit()
 
 if not TELEGRAM_CHAT_ID:
-    raise ValueError("TELEGRAM_CHAT_ID topilmadi .env da!")
-
+    print("TELEGRAM_CHAT_ID missing!")
+    exit()
 # ===== SETTINGS =====
 MIN_PRICE = 0.20
 MAX_PRICE = 10
