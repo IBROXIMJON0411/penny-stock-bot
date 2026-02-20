@@ -21,4 +21,4 @@ beautifulsoup4
 lxml
 python-dotenv
 pytz
-npm install -g wscat
+wscat
